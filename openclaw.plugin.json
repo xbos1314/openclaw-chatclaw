@@ -1,0 +1,43 @@
+{
+  "id": "openclaw-chatclaw",
+  "version": "0.1.0",
+  "channels": ["openclaw-chatclaw"],
+  "channelConfigs": {
+    "openclaw-chatclaw": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "label": "ChatClaw",
+      "description": "ChatClaw channel for web-based messaging."
+    }
+  },
+  "tools": ["chatclaw_memo","chatclaw_miniprogram","chatclaw_document"],
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "port": {
+        "type": "number",
+        "default": 9788,
+        "description": "Shared HTTP/WebSocket server port"
+      },
+      "maxConnections": {
+        "type": "number",
+        "default": 100,
+        "description": "Maximum concurrent connections"
+      },
+      "heartbeatInterval": {
+        "type": "number",
+        "default": 30000,
+        "description": "Heartbeat interval in milliseconds"
+      }
+    }
+  }
+}
