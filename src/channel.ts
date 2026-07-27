@@ -282,7 +282,9 @@ export const chatclawPlugin: ChannelPlugin<ResolvedChatClawAccount> = {
         ...(threadId ? { threadId } : {}),
       };
     },
-    handleAction: async ({ action, params, cfg, accountId }) => {
+    handleAction: async (ctx) => {
+      const { action, params, cfg, accountId } = ctx;
+      const ctxAgentId = (ctx as any)?.agentId;
       if (action !== "send") {
         throw new Error(`Action ${action} is not supported for provider openclaw-chatclaw.`);
       }
@@ -299,7 +301,13 @@ export const chatclawPlugin: ChannelPlugin<ResolvedChatClawAccount> = {
       }
 
       const resolvedAccountId = accountId ?? undefined;
-      const agentId = readStringParam(params, ["agentId", "agent_id"]);
+      // OpenClaw core 的 dispatchChannelMessageAction 会把当前 agentId 放在 ctx.agentId，
+      // 同时也会复制到 params.__agentId（下划线前缀表示内部字段）作为双保险。
+      // 这里同时支持三个来源：ctx.agentId、params.__agentId、params.agentId。
+      const agentId = readStringParam({ agentId: ctxAgentId }, ["agentId"])
+        ?? readStringParam(params, ["__agentId", "agentId", "agent_id", "fromAgentId"])
+        ?? parseAgentIdFromSessionKey((ctx as any)?.sessionKey ?? null)
+        ?? parseAgentIdFromSessionKey((params as any).__sessionKey ?? null);
       if (!agentId) {
         throw getMissingAgentIdError("ChatClaw message action=send");
       }
