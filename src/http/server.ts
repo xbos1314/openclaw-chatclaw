@@ -111,6 +111,8 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleGetFiles(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname === "/files/upload" && req.method === "POST") {
         await handleUploadFile(res, req, ctx);
+      } else if (parsedUrl.pathname === "/files/batch-delete" && req.method === "POST") {
+        await handleBatchDeleteFiles(res, req, ctx);
       } else if (parsedUrl.pathname.match(/^\/files\/download\/[^/]+\/[^/]+$/) && req.method === "GET") {
         await handleDownloadFile(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname.match(/^\/files\/[^/]+$/) && req.method === "DELETE") {
@@ -785,6 +787,61 @@ async function handleDeleteFile(
     logger.error(`delete_file failed: ${err}`);
     sendJson(res, 500, { error: "Failed to delete file" });
   }
+}
+
+async function handleBatchDeleteFiles(
+  res: http.ServerResponse,
+  req: http.IncomingMessage,
+  ctx: RequestContext | null,
+): Promise<void> {
+  const authCtx = requireAuth(ctx);
+
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+
+  const body = await parseBody<{ file_ids?: unknown }>(req);
+
+  if (!Array.isArray(body.file_ids)) {
+    sendJson(res, 400, { error: "file_ids must be an array" });
+    return;
+  }
+
+  const fileIds = body.file_ids
+    .filter((fileId): fileId is string => typeof fileId === "string" && fileId.trim().length > 0)
+    .map((fileId) => fileId.trim());
+
+  if (!fileIds.length) {
+    sendJson(res, 400, { error: "file_ids cannot be empty" });
+    return;
+  }
+
+  const deleted: string[] = [];
+  const failed: Array<{ file_id: string; error: string }> = [];
+
+  for (const fileId of Array.from(new Set(fileIds))) {
+    try {
+      const fileRecord = await filesDB.getFileRecordByFileId(fileId);
+      if (!fileRecord) {
+        failed.push({ file_id: fileId, error: "File not found" });
+        continue;
+      }
+      if (fileRecord.accountId !== authCtx.accountId) {
+        failed.push({ file_id: fileId, error: "Not authorized" });
+        continue;
+      }
+
+      fileStorage.deleteLocalFile(fileId, fileRecord.accountId);
+      await filesDB.deleteFileRecordByFileId(fileId);
+      deleted.push(fileId);
+    } catch (err) {
+      logger.error(`batch_delete_file failed for ${fileId}: ${err}`);
+      failed.push({ file_id: fileId, error: "Failed to delete file" });
+    }
+  }
+
+  sendJson(res, 200, { deleted, failed });
 }
 
 async function handleUploadFile(
