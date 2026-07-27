@@ -14,6 +14,7 @@ import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-runtime";
 import * as fileStorage from "../media/fileStorage.js";
 import { getAccountTypingStates } from "../typing/state.js";
 import { handleMemoVoice, handleMemoList, handleMemoGet, handleMemoSend, handleMemoUpdate, handleMemoDelete, handleVoiceDownload } from "./memo-handlers.js";
+import { handleFileSystemList } from "./filesystem-handlers.js";
 import {
   handleDocumentCreate,
   handleDocumentDelete,
@@ -88,6 +89,8 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleAuth(res, req, ctx);
       } else if (parsedUrl.pathname === "/files/refresh-download-token" && req.method === "POST") {
         await handleRefreshDownloadToken(res, req, ctx);
+      } else if (parsedUrl.pathname === "/filesystem/list" && req.method === "GET") {
+        await handleFileSystemList(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname === "/agents" && req.method === "GET") {
         await handleGetAgents(res, req, ctx);
       } else if (parsedUrl.pathname === "/messages/unread-count" && req.method === "GET") {
