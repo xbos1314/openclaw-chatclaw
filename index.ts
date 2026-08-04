@@ -14,6 +14,7 @@ import { startHttpServer, stopHttpServer } from "./src/http/server.js";
 import { logger } from "./src/util/logger.js";
 
 let httpServer: http.Server | null = null;
+let serverStarting = false;
 
 export default {
   id: "openclaw-chatclaw",
@@ -55,6 +56,13 @@ export default {
       return;
     }
 
+    // Prevent concurrent start attempts (synchronous guard)
+    if (serverStarting) {
+      logger.info(`ChatClaw server start already in progress, skipping`);
+      return;
+    }
+    serverStarting = true;
+
     // Start single HTTP server first, then attach WebSocket upgrade handling on /ws
     logger.info(`Starting ChatClaw HTTP server on port ${port}...`);
     startHttpServer({
@@ -73,6 +81,7 @@ export default {
     }).then(() => {
       logger.info(`ChatClaw WebSocket server attached on port ${port} path /ws`);
     }).catch((err) => {
+      serverStarting = false;
       logger.error(`Failed to start ChatClaw servers: ${err}`);
     });
 
