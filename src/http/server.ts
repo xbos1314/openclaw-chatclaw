@@ -26,6 +26,18 @@ import {
   handleDocumentUpdate,
 } from "./document-handlers.js";
 import {
+  handleCodexProjects,
+  handleCodexFind,
+  handleCodexSessions,
+  handleCodexArchivedSessions,
+  handleCodexSnapshot,
+  handleCodexArchivedSnapshot,
+  handleCodexUpdates,
+  handleCodexSend,
+  handleCodexUnarchive,
+  handleCodexNew,
+} from "../codex/http-handlers.js";
+import {
   handleMiniprogramCreate,
   handleMiniprogramBuild,
   handleMiniprogramCustomApiRequest,
@@ -177,6 +189,26 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleMiniprogramFileDelete(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname.match(/^\/api\/miniprogram\/[^/]+\/.+$/)) {
         await handleMiniprogramCustomApiRequest(res, req, parsedUrl, ctx);
+      } else if (parsedUrl.pathname === "/codex/projects" && req.method === "GET") {
+        await handleCodexProjects(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname === "/codex/projects/find" && req.method === "GET") {
+        await handleCodexFind(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname === "/codex/projects/new" && req.method === "POST") {
+        await handleCodexNew(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname === "/codex/sessions" && req.method === "GET") {
+        await handleCodexSessions(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname === "/codex/archived-sessions" && req.method === "GET") {
+        await handleCodexArchivedSessions(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/archived-sessions\/[^/]+\/snapshot$/) && req.method === "GET") {
+        await handleCodexArchivedSnapshot(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/archived-sessions\/[^/]+\/unarchive$/) && req.method === "POST") {
+        await handleCodexUnarchive(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/snapshot$/) && req.method === "GET") {
+        await handleCodexSnapshot(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/updates$/) && req.method === "GET") {
+        await handleCodexUpdates(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/send$/) && req.method === "POST") {
+        await handleCodexSend(res, req, parsedUrl, ctx!);
       } else if (parsedUrl.pathname.startsWith("/miniprogram/") && req.method === "GET") {
         await handleMiniprogramPublic(res, req, parsedUrl);
       } else if (parsedUrl.pathname.startsWith("/voices/download/") && req.method === "GET") {

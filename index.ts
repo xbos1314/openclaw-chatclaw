@@ -6,6 +6,7 @@ import { chatclawPlugin } from "./src/channel.js";
 import { registerChatClawMemoTools } from "./src/memo/tools.js";
 import { registerChatClawMiniprogramTools } from "./src/miniprogram/tools.js";
 import { registerChatClawDocumentTools } from "./src/document/tools.js";
+import { registerCodexManagerTools } from "./src/codex/tools.js";
 import { assertHostCompatibility } from "./src/compat.js";
 import { ChatClawConfigSchema } from "./src/config/config-schema.js";
 import { setChatClawRuntime } from "./src/runtime.js";
@@ -39,6 +40,9 @@ export default {
 
     // Register ChatClaw document tools
     registerChatClawDocumentTools(api);
+
+    // Register Codex manager tools
+    registerCodexManagerTools(api);
 
     // registrationMode exists in 2026.3.22+; skip heavy operations in setup-only mode
     const mode = (api as { registrationMode?: string }).registrationMode;
