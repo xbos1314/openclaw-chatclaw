@@ -1,7 +1,10 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import * as codexSessions from "./codex-sessions.js";
+import * as filesDB from "../db/files.js";
+import * as fileStorage from "../media/fileStorage.js";
 
 export const CODEX_BIN = process.env.CODEX_BIN ?? "/Users/xbos1314/.nvm/versions/node/v22.19.0/bin/codex";
 const EXEC_TIMEOUT_MS = 600_000;
@@ -15,19 +18,29 @@ const SESSION_SUMMARY_CONCURRENCY = 4;
 const ARCHIVE_INDEX_TTL_MS = 60_000;
 const ARCHIVE_STAT_CONCURRENCY = 8;
 
-export interface CodexProject { name: string; path: string; sessions: number; last_active: string; }
+export interface CodexProject { name: string; path: string; sessions: number; last_active: string; summary: string; }
 export interface CodexSessionItem { id: string; project: string; origin: string; last_active: string; summary: string; archived_at?: string; }
 export interface CodexMessage { ts: string; role: "user" | "assistant"; text: string; }
 export interface CodexLastMessage { ts: string; role: "user" | "assistant"; text: string; }
 export interface CodexStatus { session_id: string; project: string; status: "running" | "completed"; last_write_sec: number; last_complete_at: string | null; last_message: CodexLastMessage | null; }
 export interface CodexPage<T> { items: T[]; has_more: boolean; next_cursor: string | null; }
-export interface CodexSnapshot { session_id: string; project: string; messages: CodexMessage[]; cursor: string; status: CodexStatus; }
-export interface CodexUpdates { session_id: string; messages: CodexMessage[]; cursor: string; reset: boolean; status: CodexStatus; }
+export interface CodexSnapshot { session_id: string; project: string; messages: CodexMessage[]; cursor: string; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; }
+export interface CodexUpdates { session_id: string; messages: CodexMessage[]; cursor: string; reset: boolean; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; }
 export interface CodexRunResult { exit_code: number; output: string; stderr: string; timed_out: boolean; }
 export interface CodexExecOptions { fullAuto?: boolean; timeoutMs?: number; }
+export interface CodexSendAttachmentInput {
+  type: "image" | "video" | "voice" | "audio" | "file" | "path";
+  file_id?: string;
+  file_path?: string;
+  duration?: number;
+}
+export interface CodexSendOptions extends CodexExecOptions {
+  accountId?: string;
+  attachments?: CodexSendAttachmentInput[];
+}
 
 interface CachedSession { file: string; meta: codexSessions.CodexMeta; archived: boolean; }
-interface RuntimeState { status: CodexStatus; }
+interface RuntimeState { status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; }
 interface ArchiveFileEntry { file: string; archivedAtMs: number; }
 const sessionCache = new Map<string, CachedSession>();
 const runtimeCache = new Map<string, RuntimeState>();
@@ -105,17 +118,25 @@ async function archivedEntries(cursor?: string, limit = PAGE_SIZE): Promise<Code
 /** 最近活跃项目；sessions 是当前页中出现的会话数，不代表历史总数。 */
 export async function listProjects(cursor?: string, limit?: number, keyword?: string): Promise<CodexPage<CodexProject>> {
   const page = await activeEntries(cursor, limit);
-  const seen = new Map<string, CodexProject>();
+  const seen = new Map<string, { project: CodexProject; latestFile: string; latestFileSize: number }>();
   const kw = keyword?.toLowerCase().trim();
   for (const entry of page.items) {
     const cwd = String(entry.meta.cwd ?? "(未知)");
     const name = cwd === "(未知)" ? cwd : path.basename(cwd);
     if (kw && !cwd.toLowerCase().includes(kw) && !name.toLowerCase().includes(kw)) continue;
     const current = seen.get(cwd);
-    if (current) { current.sessions += 1; continue; }
-    seen.set(cwd, { name, path: cwd, sessions: 1, last_active: codexSessions.formatTime(new Date(entry.mtimeMs).toISOString()) });
+    if (current) { current.project.sessions += 1; continue; }
+    seen.set(cwd, {
+      project: { name, path: cwd, sessions: 1, last_active: codexSessions.formatTime(new Date(entry.mtimeMs).toISOString()), summary: "" },
+      latestFile: entry.file,
+      latestFileSize: entry.size,
+    });
   }
-  return { items: [...seen.values()], has_more: page.has_more, next_cursor: page.next_cursor };
+  const items = await mapWithConcurrency([...seen.values()], SESSION_SUMMARY_CONCURRENCY, async (item) => ({
+    ...item.project,
+    summary: await readLastTextSummary(item.latestFile, item.latestFileSize),
+  }));
+  return { items, has_more: page.has_more, next_cursor: page.next_cursor };
 }
 
 export async function listSessions(project?: string, cursor?: string, limit?: number): Promise<CodexPage<CodexSessionItem>> {
@@ -125,7 +146,7 @@ export async function listSessions(project?: string, cursor?: string, limit?: nu
     project: String(entry.meta.cwd ?? "").split("/").pop() ?? "",
     origin: String(entry.meta.originator ?? ""),
     last_active: codexSessions.formatTime(new Date(entry.mtimeMs).toISOString()),
-    summary: await readLastUserSummary(entry.file, entry.size),
+    summary: await readLastTextSummary(entry.file, entry.size),
   }));
   return {
     items: items.filter((item) => item.id),
@@ -143,7 +164,7 @@ export async function listArchivedSessions(cursor?: string, limit?: number): Pro
 		origin: String(entry.meta.originator ?? ""),
 		last_active: codexSessions.formatTime(new Date(entry.mtimeMs).toISOString()),
 		archived_at: codexSessions.formatTime(new Date(entry.archivedAtMs).toISOString(), true),
-		summary: await readLastUserSummary(entry.file, entry.size),
+		summary: await readLastTextSummary(entry.file, entry.size),
 	}));
 	return {
 		items: items.filter((item) => item.id),
@@ -153,12 +174,12 @@ export async function listArchivedSessions(cursor?: string, limit?: number): Pro
 }
 
 /** 仅查阅有限的文件尾部，避免列表页为摘要读取完整 JSONL。 */
-async function readLastUserSummary(file: string, size: number): Promise<string> {
+async function readLastTextSummary(file: string, size: number): Promise<string> {
   try {
     const tail = await codexSessions.readTail(file, size, SESSION_SUMMARY_TAIL_BYTES);
     const messages = codexSessions.extractMessages(codexSessions.parseEvents(tail.text));
-    const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
-    return lastUserMessage ? codexSessions.truncateText(lastUserMessage.text.replace(/\s+/g, " "), SESSION_SUMMARY_MAX_LENGTH) : "";
+    const lastMessage = [...messages].reverse().find((message) => message.text.trim());
+    return lastMessage ? codexSessions.truncateText(lastMessage.text.replace(/\s+/g, " "), SESSION_SUMMARY_MAX_LENGTH) : "";
   } catch {
     return "";
   }
@@ -194,8 +215,12 @@ async function resolveSession(sessionId: string, archived = false): Promise<Cach
 	throw new CodexNotFoundError(`找不到${archived ? "归档" : "活跃"}会话: ${sessionId}`);
 }
 
-function formatMessages(events: codexSessions.CodexEvent[]): CodexMessage[] {
-  return codexSessions.extractMessages(events).map((message) => ({ ts: codexSessions.formatTime(message.ts, true), role: message.role, text: codexSessions.truncateText(message.text) }));
+function formatMessages(events: codexSessions.CodexEvent[], _accountId?: string): CodexMessage[] {
+  return codexSessions.extractMessages(events).map((message) => ({
+    ts: codexSessions.formatTime(message.ts, true),
+    role: message.role,
+    text: message.text,
+  }));
 }
 
 function buildStatus(sessionId: string, project: string, mtimeMs: number, events: codexSessions.CodexEvent[], fallback?: CodexStatus): CodexStatus {
@@ -215,7 +240,7 @@ function buildStatus(sessionId: string, project: string, mtimeMs: number, events
 }
 
 /** 首次进入详情页：仅读取当前活跃会话的尾部。 */
-async function getSnapshotFromEntry(sessionId: string, archived: boolean, limit = 50): Promise<CodexSnapshot & { archived: boolean; archived_at: string | null }> {
+async function getSnapshotFromEntry(sessionId: string, archived: boolean, limit = 50, accountId?: string): Promise<CodexSnapshot & { archived: boolean; archived_at: string | null }> {
 	const entry = await resolveSession(sessionId, archived);
 	const stats = await codexSessions.fileStat(entry.file);
 	const tail = await codexSessions.readTail(entry.file, stats.size);
@@ -223,49 +248,54 @@ async function getSnapshotFromEntry(sessionId: string, archived: boolean, limit 
   const id = String(entry.meta.session_id ?? sessionId);
 	const project = String(entry.meta.cwd ?? "");
 	const status = buildStatus(id, project, stats.mtimeMs, events, runtimeCache.get(id)?.status);
-	runtimeCache.set(id, { status });
+	const activity = codexSessions.extractLatestTurnActivity(events, runtimeCache.get(id)?.activity);
+	runtimeCache.set(id, { status, activity });
 	return {
 		session_id: id,
 		project,
-		messages: formatMessages(events).slice(-clampLimit(limit)),
+		messages: formatMessages(events, accountId).slice(-clampLimit(limit)),
 		cursor: String(tail.nextOffset),
 		status,
+		activity,
 		archived,
 		archived_at: archived ? codexSessions.formatTime(new Date(stats.ctimeMs).toISOString(), true) : null,
 	};
 }
 
 /** 首次进入详情页：仅读取当前活跃会话的尾部。 */
-export async function getSnapshot(sessionId: string, limit = 50): Promise<CodexSnapshot> {
-	const snapshot = await getSnapshotFromEntry(sessionId, false, limit);
+export async function getSnapshot(sessionId: string, limit = 50, accountId?: string): Promise<CodexSnapshot> {
+	const snapshot = await getSnapshotFromEntry(sessionId, false, limit, accountId);
 	return snapshot;
 }
 
 /** 归档详情只读取一次有限尾部快照，不启动轮询。 */
-export async function getArchivedSnapshot(sessionId: string, limit = 50): Promise<CodexSnapshot & { archived: true; archived_at: string | null }> {
-	return getSnapshotFromEntry(sessionId, true, limit) as Promise<CodexSnapshot & { archived: true; archived_at: string | null }>;
+export async function getArchivedSnapshot(sessionId: string, limit = 50, accountId?: string): Promise<CodexSnapshot & { archived: true; archived_at: string | null }> {
+	return getSnapshotFromEntry(sessionId, true, limit, accountId) as Promise<CodexSnapshot & { archived: true; archived_at: string | null }>;
 }
 
 /** 详情页轮询：无变化只 stat；有变化只读取此前游标之后的完整 JSONL 行。 */
-export async function getUpdates(sessionId: string, cursor: string): Promise<CodexUpdates> {
+export async function getUpdates(sessionId: string, cursor: string, accountId?: string): Promise<CodexUpdates> {
   const entry = await resolveSession(sessionId);
   const stats = await codexSessions.fileStat(entry.file);
   const previous = Number(cursor);
   if (!Number.isFinite(previous) || previous < 0 || stats.size < previous) {
-    const snapshot = await getSnapshot(sessionId);
-    return { session_id: snapshot.session_id, messages: snapshot.messages, cursor: snapshot.cursor, reset: true, status: snapshot.status };
+    const snapshot = await getSnapshot(sessionId, 50, accountId);
+    return { session_id: snapshot.session_id, messages: snapshot.messages, cursor: snapshot.cursor, reset: true, status: snapshot.status, activity: snapshot.activity };
   }
   const id = String(entry.meta.session_id ?? sessionId);
   const project = String(entry.meta.cwd ?? "");
   if (stats.size === previous) {
-    const status = runtimeCache.get(id)?.status ?? buildStatus(id, project, stats.mtimeMs, []);
-    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) } };
+    const cached = runtimeCache.get(id);
+    const status = cached?.status ?? buildStatus(id, project, stats.mtimeMs, []);
+    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) }, activity: cached?.activity ?? null };
   }
   const range = await codexSessions.readCompleteRange(entry.file, previous, stats.size, MAX_UPDATE_BYTES);
   const events = codexSessions.parseEvents(range.text);
-  const status = buildStatus(id, project, stats.mtimeMs, events, runtimeCache.get(id)?.status);
-  runtimeCache.set(id, { status });
-	return { session_id: id, messages: formatMessages(events), cursor: String(range.nextOffset), reset: false, status };
+  const cached = runtimeCache.get(id);
+  const status = buildStatus(id, project, stats.mtimeMs, events, cached?.status);
+  const activity = codexSessions.extractLatestTurnActivity(events, cached?.activity);
+  runtimeCache.set(id, { status, activity });
+	return { session_id: id, messages: formatMessages(events, accountId), cursor: String(range.nextOffset), reset: false, status, activity };
 }
 
 /**
@@ -286,15 +316,71 @@ export async function unarchiveSession(sessionId: string, options: CodexExecOpti
 	return { session_id: fullSessionId, project: String(meta.cwd ?? "") };
 }
 
-export async function sendMessage(sessionId: string, message: string, options: CodexExecOptions = {}): Promise<{ session_id: string; reply: string; exit_code: number }> {
+function isSameOrChildPath(candidate: string, parent: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function isMediaTypeCompatible(type: CodexSendAttachmentInput["type"], contentType: string): boolean {
+  if (type === "file") return true;
+  if (type === "image") return contentType.startsWith("image/");
+  if (type === "video") return contentType.startsWith("video/");
+  if (type === "voice" || type === "audio") return contentType.startsWith("audio/");
+  return false;
+}
+
+async function resolveAttachments(
+  inputs: CodexSendAttachmentInput[] | undefined,
+  accountId: string | undefined,
+): Promise<Array<{ fileName: string; filePath: string }>> {
+  const attachments = inputs ?? [];
+  if (!attachments.length) return [];
+  if (!accountId) throw new Error("附件发送需要认证账号");
+  const resolved: Array<{ fileName: string; filePath: string }> = [];
+  const homeDir = await fs.realpath(os.homedir()).catch(() => "");
+  if (!homeDir) throw new Error("本机文件存储不可用");
+  let accountStorageDir = "";
+
+  for (const input of attachments) {
+    if (input.type === "path") {
+      const requested = String(input.file_path ?? "").trim();
+      if (!requested) throw new Error("路径不能为空");
+      const realPath = await fs.realpath(requested).catch(() => "");
+      if (!realPath || !isSameOrChildPath(realPath, homeDir)) throw new Error("路径不存在或超出 home 目录");
+      await fs.access(realPath).catch(() => { throw new Error("路径不可读取"); });
+      resolved.push({ fileName: path.basename(realPath) || realPath, filePath: realPath });
+      continue;
+    }
+
+    const fileId = String(input.file_id ?? "").trim();
+    if (!fileId) throw new Error("文件标识不能为空");
+    const record = await filesDB.getFileRecordByFileId(fileId);
+    if (!record || record.accountId !== accountId) throw new Error("文件不存在或无权访问");
+    if (!isMediaTypeCompatible(input.type, record.contentType)) throw new Error("附件类型与文件类型不匹配");
+    if (!accountStorageDir) accountStorageDir = await fs.realpath(fileStorage.getUserStorageDir(accountId)).catch(() => "");
+    if (!accountStorageDir) throw new Error("本机文件存储不可用");
+    const expectedPath = fileStorage.getFilePath(record.fileId, accountId);
+    const realPath = await fs.realpath(expectedPath).catch(() => "");
+    if (!realPath || !isSameOrChildPath(realPath, accountStorageDir)) throw new Error("上传文件不可用");
+    const stats = await fs.stat(realPath).catch(() => null);
+    if (!stats?.isFile()) throw new Error("上传文件不可用");
+    resolved.push({ fileName: record.fileName, filePath: realPath });
+  }
+  return resolved;
+}
+
+export async function sendMessage(sessionId: string, message: string, options: CodexSendOptions = {}): Promise<{ session_id: string; reply: string; content: string; exit_code: number }> {
   const { meta } = await resolveSession(sessionId);
   const cwd = String(meta.cwd ?? process.cwd());
   const fullSessionId = String(meta.session_id ?? sessionId);
+  const attachments = await resolveAttachments(options.attachments, options.accountId);
+  const input = codexSessions.serializeChatClawMessage(attachments, message);
+  if (!input) throw new Error("消息或附件不能为空");
   const args = ["exec", "resume"];
   if (options.fullAuto) args.push("--dangerously-bypass-approvals-and-sandbox");
-  args.push(fullSessionId, message);
-  const result = await runCodex(args, cwd, options.timeoutMs);
-  return { session_id: fullSessionId, reply: codexSessions.truncateText(result.output.trim() || result.stderr.trim(), MAX_OUTPUT), exit_code: result.exit_code };
+  args.push(fullSessionId, input);
+  await startCodexDetached(args, cwd);
+  return { session_id: fullSessionId, reply: "续跑已启动", content: input, exit_code: 0 };
 }
 
 export async function newSession(projectDir: string, message: string, options: CodexExecOptions = {}): Promise<{ session_id: string; project: string; output: string; exit_code: number }> {
@@ -324,6 +410,18 @@ async function waitForNewSessionFile(before: Set<string>, timeoutMs: number): Pr
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return "";
+}
+
+/** 启动续跑后立即脱离 HTTP 请求，任务执行时长不会影响发送接口。 */
+function startCodexDetached(args: string[], cwd: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(CODEX_BIN, args, { cwd, detached: true, stdio: "ignore" });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 function runCodex(args: string[], cwd: string, timeoutMs = EXEC_TIMEOUT_MS): Promise<CodexRunResult> {

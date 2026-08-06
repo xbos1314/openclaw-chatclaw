@@ -11,6 +11,7 @@ import { logger } from "../util/logger.js";
 
 interface SendMessageBody {
   message?: string;
+  attachments?: manager.CodexSendAttachmentInput[];
   full_auto?: boolean;
 }
 
@@ -125,7 +126,7 @@ export async function handleCodexSnapshot(
   try {
     const sessionId = extractSessionId(parsedUrl);
     const limit = parseInt(parsedUrl.searchParams.get("limit") ?? "20", 10);
-    const result = await manager.getSnapshot(sessionId, Number.isFinite(limit) ? limit : 50);
+    const result = await manager.getSnapshot(sessionId, Number.isFinite(limit) ? limit : 50, ctx.accountId);
     sendJson(res, 200, { code: 0, data: result });
   } catch (err) {
     handleError(res, err);
@@ -143,7 +144,7 @@ export async function handleCodexArchivedSnapshot(
 	try {
 		const sessionId = extractSessionId(parsedUrl);
 		const limit = parseInt(parsedUrl.searchParams.get("limit") ?? "20", 10);
-		const result = await manager.getArchivedSnapshot(sessionId, Number.isFinite(limit) ? limit : 50);
+		const result = await manager.getArchivedSnapshot(sessionId, Number.isFinite(limit) ? limit : 50, ctx.accountId);
 		sendJson(res, 200, { code: 0, data: result });
 	} catch (err) {
 		handleError(res, err);
@@ -161,7 +162,7 @@ export async function handleCodexUpdates(
   try {
     const sessionId = extractSessionId(parsedUrl);
     const cursor = parsedUrl.searchParams.get("cursor") ?? "";
-    const result = await manager.getUpdates(sessionId, cursor);
+    const result = await manager.getUpdates(sessionId, cursor, ctx.accountId);
     sendJson(res, 200, { code: 0, data: result });
   } catch (err) {
     handleError(res, err);
@@ -178,14 +179,17 @@ export async function handleCodexSend(
   requireAuth(ctx);
   try {
     const body = await parseBody<SendMessageBody>(req);
-    const message = (body.message ?? "").trim();
-    if (!message) {
-      sendJson(res, 200, { code: 1, error: "message is required" });
+    const message = typeof body.message === "string" ? body.message.trim() : "";
+    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    if (!message && !attachments.length) {
+      sendJson(res, 200, { code: 1, error: "message or attachments is required" });
       return;
     }
     const sessionId = extractSessionId(parsedUrl);
     const result = await manager.sendMessage(sessionId, message, {
       fullAuto: body.full_auto ?? false,
+      accountId: ctx.accountId,
+      attachments,
     });
     sendJson(res, 200, {
       code: 0,

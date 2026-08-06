@@ -15,6 +15,7 @@ import * as fileStorage from "../media/fileStorage.js";
 import { getAccountTypingStates } from "../typing/state.js";
 import { handleMemoVoice, handleMemoList, handleMemoGet, handleMemoSend, handleMemoUpdate, handleMemoDelete, handleVoiceDownload } from "./memo-handlers.js";
 import { handleFileSystemList } from "./filesystem-handlers.js";
+import { handleLocalFileMeta, handleLocalFileText, handleLocalFileView } from "./local-file-handlers.js";
 import {
   handleDocumentCreate,
   handleDocumentDelete,
@@ -123,6 +124,12 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleGetFiles(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname === "/files/upload" && req.method === "POST") {
         await handleUploadFile(res, req, ctx);
+      } else if (parsedUrl.pathname === "/files/local/meta" && req.method === "GET") {
+        await handleLocalFileMeta(res, req, parsedUrl, ctx);
+      } else if (parsedUrl.pathname === "/files/local/text" && req.method === "GET") {
+        await handleLocalFileText(res, req, parsedUrl, ctx);
+      } else if (parsedUrl.pathname === "/files/local/view" && req.method === "GET") {
+        await handleLocalFileView(res, req, parsedUrl, ctx);
       } else if (parsedUrl.pathname === "/files/batch-delete" && req.method === "POST") {
         await handleBatchDeleteFiles(res, req, ctx);
       } else if (parsedUrl.pathname.match(/^\/files\/download\/[^/]+\/[^/]+$/) && req.method === "GET") {
