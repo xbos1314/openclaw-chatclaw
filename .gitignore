@@ -8,3 +8,6 @@ coverage/
 # Codex session data (local only)
 sessions/
 archived_sessions/
+
+# Local env secrets
+.env
