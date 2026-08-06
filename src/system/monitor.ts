@@ -291,12 +291,17 @@ async function collectDocker(): Promise<ServiceOverview> {
     runCommand(executable, ["ps", "-a", "--format", "{{json .}}"]),
     runCommand(executable, ["stats", "--no-stream", "--format", "{{json .}}"]),
   ]);
-  const containerItems: Array<{ name: string; state: string; image: string }> = [];
+  const containerItems: Array<{ name: string; state: string; image: string; ports: string }> = [];
   if (containers.ok) {
     containers.stdout.split("\n").filter(Boolean).forEach((line) => {
       try {
         const value = JSON.parse(line) as Record<string, string>;
-        containerItems.push({ name: String(value.Names || "未命名容器"), state: String(value.State || "unknown"), image: String(value.Image || "") });
+        containerItems.push({
+          name: String(value.Names || "未命名容器"),
+          state: String(value.State || "unknown"),
+          image: String(value.Image || ""),
+          ports: String(value.Ports || "未映射端口"),
+        });
       } catch {
         // Ignore a malformed container line while keeping other containers visible.
       }
