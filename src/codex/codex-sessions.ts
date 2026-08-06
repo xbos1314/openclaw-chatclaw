@@ -180,6 +180,7 @@ const INTERNAL_CONTEXT_TAGS = [
   "developer_instructions",
   "recommended_plugins",
 ];
+const AGENTS_INSTRUCTIONS_BLOCK = /(?:^|\n)\s*#\s*AGENTS\.md instructions for[^\r\n]*\r?\n\s*<INSTRUCTIONS>\s*[\s\S]*?<\/INSTRUCTIONS>\s*(?=\n|$)/gi;
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -187,6 +188,8 @@ function escapeRegExp(value: string): string {
 /** 删除 Codex 写入 JSONL 的内部运行环境块，保留真正的对话正文。 */
 export function stripInternalContext(text: string): string {
   let output = String(text ?? "");
+  // Codex 将项目 AGENTS.md 作为 role=user 的独立 input_text 写入 JSONL；这不是用户实际发送的消息。
+  output = output.replace(AGENTS_INSTRUCTIONS_BLOCK, "");
   for (const tag of INTERNAL_CONTEXT_TAGS) {
     const escaped = escapeRegExp(tag);
     output = output.replace(new RegExp(`<${escaped}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escaped}>`, "gi"), "");
