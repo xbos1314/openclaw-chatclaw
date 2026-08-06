@@ -17,7 +17,9 @@
       "description": "ChatClaw channel for web-based messaging."
     }
   },
-  "tools": ["chatclaw_memo","chatclaw_miniprogram","chatclaw_document"],
+  "contracts": {
+    "tools": ["chatclaw_memo", "chatclaw_miniprogram", "chatclaw_document", "codex_manager"]
+  },
   "skills": ["./skills"],
   "configSchema": {
     "type": "object",
