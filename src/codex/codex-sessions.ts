@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -182,8 +183,37 @@ const INTERNAL_CONTEXT_TAGS = [
 ];
 const AGENTS_INSTRUCTIONS_BLOCK = /(?:^|\n)\s*#\s*AGENTS\.md instructions for[^\r\n]*\r?\n\s*<INSTRUCTIONS>\s*[\s\S]*?<\/INSTRUCTIONS>\s*(?=\n|$)/gi;
 const CODEX_UI_DIRECTIVE_LINE = /(?:^|\n)\s*::(?:git-(?:stage|commit|create-branch|push|create-pr)|created-thread)\{[^\n]*\}\s*(?=\n|$)/gi;
+const CODEX_DESKTOP_IMAGE_TAG = /<image\b[^>]*\bpath\s*=\s*(["'])(.*?)\1[^>]*>/gi;
+const CODEX_DESKTOP_IMAGE_CLOSE_TAG = /<\/image\s*>/gi;
+const STANDALONE_CODEX_DESKTOP_IMAGE_CLOSE_TAG = /^\s*<\/image\s*>\s*$/i;
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** 仅转换当前网关进程实际可读取的桌面端图片路径，避免吞掉无法预览的原始内容。 */
+function isReadableDesktopImagePath(filePath: string): boolean {
+  const candidate = String(filePath || "").trim();
+  if (!candidate || !path.isAbsolute(candidate)) return false;
+  try {
+    const stats = fsSync.statSync(candidate);
+    fsSync.accessSync(candidate, fsSync.constants.R_OK);
+    return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasConvertibleDesktopImageTag(text: string): boolean {
+  CODEX_DESKTOP_IMAGE_TAG.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CODEX_DESKTOP_IMAGE_TAG.exec(text))) {
+    if (isReadableDesktopImagePath(match[2] || "")) {
+      CODEX_DESKTOP_IMAGE_TAG.lastIndex = 0;
+      return true;
+    }
+  }
+  CODEX_DESKTOP_IMAGE_TAG.lastIndex = 0;
+  return false;
 }
 
 /** 删除 Codex 写入 JSONL 的内部运行环境块，保留真正的对话正文。 */
@@ -193,6 +223,18 @@ export function stripInternalContext(text: string): string {
   output = output.replace(AGENTS_INSTRUCTIONS_BLOCK, "");
   // Codex 桌面端的 Git/线程 UI 指令仅供本地客户端消费，不属于应展示给 ChatClaw 用户的回复正文。
   output = output.replace(CODEX_UI_DIRECTIVE_LINE, "");
+  // 桌面端/CLI 发送图片时会写入专有 image 标签，统一转换为小程序已支持的标准本地文件链接。
+  let convertedDesktopImage = false;
+  output = output.replace(CODEX_DESKTOP_IMAGE_TAG, (tag, _quote, filePath: string) => {
+    // 文件不存在、不是绝对路径或网关无读取权限时完整保留原始标记，供原客户端继续使用。
+    if (!isReadableDesktopImagePath(filePath)) return tag;
+    convertedDesktopImage = true;
+    const nameMatch = /\bname\s*=\s*(?:\[([^\]]+)\]|"([^"]*)"|'([^']*)')/i.exec(tag);
+    const fileName = nameMatch?.[1] || nameMatch?.[2] || nameMatch?.[3] || path.basename(filePath) || "图片";
+    return formatLocalFileLink(fileName, filePath);
+  });
+  // 同一个文本片段内的闭合标签属于已转换图片标记；普通正文不做全局删除。
+  if (convertedDesktopImage) output = output.replace(CODEX_DESKTOP_IMAGE_CLOSE_TAG, "");
   for (const tag of INTERNAL_CONTEXT_TAGS) {
     const escaped = escapeRegExp(tag);
     output = output.replace(new RegExp(`<${escaped}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escaped}>`, "gi"), "");
@@ -217,6 +259,7 @@ export function serializeChatClawMessage(files: Array<{ fileName: string; filePa
 
 export function extractMessages(events: CodexEvent[]): CodexMessage[] {
   const messages: CodexMessage[] = [];
+  let awaitingDesktopImageCloseTag = false;
   for (const event of events) {
     if (event.type !== "response_item") continue;
     const payload = event.payload;
@@ -233,6 +276,11 @@ export function extractMessages(events: CodexEvent[]): CodexMessage[] {
         typeof part.text === "string" &&
         part.text.trim()
       ) {
+        const rawText = part.text;
+        if (awaitingDesktopImageCloseTag && STANDALONE_CODEX_DESKTOP_IMAGE_CLOSE_TAG.test(rawText)) {
+          awaitingDesktopImageCloseTag = false;
+          continue;
+        }
         const cleaned = stripInternalContext(part.text);
         if (!cleaned) continue;
         messages.push({
@@ -240,6 +288,9 @@ export function extractMessages(events: CodexEvent[]): CodexMessage[] {
           role: role as CodexMessage["role"],
           text: cleaned,
         });
+        awaitingDesktopImageCloseTag = hasConvertibleDesktopImageTag(rawText) && !CODEX_DESKTOP_IMAGE_CLOSE_TAG.test(rawText);
+        CODEX_DESKTOP_IMAGE_TAG.lastIndex = 0;
+        CODEX_DESKTOP_IMAGE_CLOSE_TAG.lastIndex = 0;
       }
     }
   }

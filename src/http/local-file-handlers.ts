@@ -45,12 +45,16 @@ function isSensitivePath(realPath: string, homePath: string): boolean {
 export async function resolveLocalFile(requestedPath: string): Promise<LocalFileInfo> {
   const requested = String(requestedPath || "").trim();
   if (!requested || !path.isAbsolute(requested)) throw new LocalFileError(400, "path must be an absolute path");
-  const [homePath, realPath] = await Promise.all([
+  // Codex Desktop 的截图常位于 /var/folders；/var 文件仍须通过现有下载令牌鉴权后才能访问。
+  const [homePath, varPath, realPath] = await Promise.all([
     fsp.realpath(os.homedir()).catch(() => ""),
+    fsp.realpath("/var").catch(() => ""),
     fsp.realpath(requested).catch(() => ""),
   ]);
   if (!homePath || !realPath) throw new LocalFileError(404, "File not found");
-  if (!isSameOrChildPath(realPath, homePath) || isSensitivePath(realPath, homePath)) {
+  const inHome = isSameOrChildPath(realPath, homePath);
+  const inVar = Boolean(varPath) && isSameOrChildPath(realPath, varPath);
+  if ((!inHome && !inVar) || (inHome && isSensitivePath(realPath, homePath))) {
     throw new LocalFileError(403, "File path is not allowed");
   }
   const stats = await fsp.stat(realPath).catch(() => null);
