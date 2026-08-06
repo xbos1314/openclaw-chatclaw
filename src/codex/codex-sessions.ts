@@ -249,6 +249,7 @@ export function taskStatus(events: CodexEvent[]): CodexTaskStatus {
 }
 
 const MAX_ACTIVITY_STEPS = 24;
+const MAX_ACTIVITY_DETAIL_LENGTH = 96;
 
 function asObject(value: unknown): Record<string, any> {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, any>;
@@ -305,8 +306,9 @@ function appendActivity(activity: CodexTurnActivity, step: CodexActivityStep): v
 function completeStep(step: CodexActivityStep, failed = false): void {
   step.status = failed ? "failed" : "completed";
   if (step.kind === "file_read") step.text = failed ? "查看文件失败" : step.text.replace(/^正在查看 /, "已查看 ");
-  else if (step.kind === "command") step.text = failed ? "命令执行失败" : "已执行命令";
+  else if (step.kind === "command") step.text = failed ? step.text.replace(/^正在执行：/, "命令执行失败：") : step.text.replace(/^正在执行：/, "已执行：");
   else if (step.kind === "tool") step.text = failed ? step.text.replace(/^正在调用工具：/, "工具调用失败：") : step.text.replace(/^正在调用工具：/, "已完成工具调用：");
+  else if (step.kind === "file_edit") step.text = failed ? step.text.replace(/^正在编辑 /, "编辑失败：") : step.text.replace(/^正在编辑 /, "已编辑 ");
   else if (step.kind === "thinking") step.text = failed ? "思考中断" : "已完成思考";
 }
 
@@ -324,26 +326,86 @@ function completeRunningThinking(activity: CodexTurnActivity): void {
   refreshLatest(activity);
 }
 
-function visiblePathFromCommand(command: string): string {
-  const normalized = String(command || "").replace(/\\\\/g, "/");
-  const match = normalized.match(/(?:^|\s)((?:docs?|documents|src|components|pages|services)\/[A-Za-z0-9_./-]+)/i);
-  return match?.[1] ?? "";
+function compactActivityDetail(value: string): string {
+  const normalized = String(value || "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\b(Bearer)\s+[^\s'"`]+/gi, "$1 ***")
+    .replace(/\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY))\s*=\s*[^\s'"`]+/g, "$1=***")
+    .replace(/(^|\s)(--?(?:token|secret|password|api[-_]?key))\s*(?:=|\s+)\s*[^\s'"`]+/gi, "$1$2 ***")
+    .trim();
+  return normalized.length > MAX_ACTIVITY_DETAIL_LENGTH ? `${normalized.slice(0, MAX_ACTIVITY_DETAIL_LENGTH)}…` : normalized;
+}
+
+function displayPath(value: string): string {
+  const normalized = String(value || "").replace(/^file:\/\//i, "").replace(/\\\\/g, "/").replace(/[<>]/g, "").trim();
+  const known = normalized.match(/(?:docs?|documents|src|components|pages|services)\/[A-Za-z0-9_./-]+/i);
+  if (known?.[0]) return known[0];
+  const segments = normalized.split("/").filter(Boolean);
+  return segments.slice(-2).join("/") || normalized;
+}
+
+function appendKnownPaths(value: string, paths: string[]): void {
+  const matches = String(value || "").matchAll(/(?:docs?|documents|src|components|pages|services)\/[A-Za-z0-9_./-]+/gi);
+  for (const match of matches) paths.push(displayPath(match[0]));
+}
+
+function extractActivityPaths(value: unknown): string[] {
+  const paths: string[] = [];
+  const visit = (candidate: unknown): void => {
+    if (typeof candidate === "string") {
+      appendKnownPaths(candidate, paths);
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) visit(item);
+      return;
+    }
+    if (!candidate || typeof candidate !== "object") return;
+    const record = candidate as Record<string, unknown>;
+    for (const key of ["path", "file_path", "file", "filename", "uri"]) {
+      if (typeof record[key] === "string") paths.push(displayPath(record[key] as string));
+    }
+    for (const key of ["patch", "diff", "changes", "files"]) visit(record[key]);
+  };
+  visit(value);
+  return [...new Set(paths.filter(Boolean))];
+}
+
+function formatActivityPaths(paths: string[], total?: number): string {
+  const visible = paths.slice(0, 2).map(displayPath).filter(Boolean);
+  if (!visible.length) return "";
+  const count = Math.max(Number(total) || 0, paths.length);
+  return `${visible.join("、")}${count > visible.length ? ` 等 ${count} 个文件` : ""}`;
+}
+
+function describeEdit(prefix: "正在编辑" | "已编辑", paths: string[], changed?: number): string {
+  const detail = formatActivityPaths(paths, changed);
+  return detail ? `${prefix} ${detail}` : `${prefix} ${Math.max(1, Number(changed) || 1)} 个文件`;
+}
+
+function commandFor(payload: Record<string, any>, input: Record<string, any>): string {
+  return String(input.cmd ?? input.command ?? payload.command ?? "");
 }
 
 function describeToolCall(payload: Record<string, any>): { kind: CodexActivityKind; text: string; callId?: string } {
   const name = String(payload.name ?? payload.tool_name ?? "");
   const callId = String(payload.call_id ?? payload.id ?? "");
-  const input = asObject(payload.input ?? payload.arguments ?? payload.params);
+  const rawInput = payload.input ?? payload.arguments ?? payload.params;
+  const input = asObject(rawInput);
   if (name === "exec" || name === "exec_command") {
-    const filePath = visiblePathFromCommand(String(input.cmd ?? input.command ?? ""));
-    return { kind: filePath ? "file_read" : "command", text: filePath ? `正在查看 ${filePath}` : "正在执行命令", ...(callId ? { callId } : {}) };
+    const command = commandFor(payload, input);
+    const paths = extractActivityPaths(command);
+    const readsFiles = /\b(cat|sed|head|tail|less|more|rg|grep|find|ls)\b/.test(command);
+    if (readsFiles && paths.length) return { kind: "file_read", text: `正在查看 ${formatActivityPaths(paths)}`, ...(callId ? { callId } : {}) };
+    return { kind: "command", text: `正在执行：${compactActivityDetail(command) || "命令"}`, ...(callId ? { callId } : {}) };
   }
   if (name === "apply_patch" || name === "write_file" || name === "edit_file") {
-    return { kind: "file_edit", text: "正在编辑文件", ...(callId ? { callId } : {}) };
+    return { kind: "file_edit", text: describeEdit("正在编辑", extractActivityPaths([input, rawInput])), ...(callId ? { callId } : {}) };
   }
   if (name === "read_file" || name === "read_mcp_resource") {
-    const filePath = String(input.path ?? input.file_path ?? input.uri ?? "");
-    return { kind: "file_read", text: filePath ? `正在查看 ${filePath}` : "正在查看文件", ...(callId ? { callId } : {}) };
+    const detail = formatActivityPaths(extractActivityPaths([input, rawInput]));
+    return { kind: "file_read", text: detail ? `正在查看 ${detail}` : "正在查看文件", ...(callId ? { callId } : {}) };
   }
   return { kind: "tool", text: `正在调用工具：${name || "未知工具"}`, ...(callId ? { callId } : {}) };
 }
@@ -398,11 +460,12 @@ export function extractLatestTurnActivity(events: CodexEvent[], previous?: Codex
     if (event.type === "event_msg" && payload.type === "patch_apply_end") {
       const callId = String(payload.call_id ?? "");
       const changed = Array.isArray(payload.changes) ? payload.changes.length : Number(payload.files_changed ?? payload.changed_files ?? 1) || 1;
+      const paths = extractActivityPaths(payload.changes ?? payload.files);
       const target = callId ? [...activity.activities].reverse().find((step) => step.call_id === callId) : null;
       if (target) {
         target.kind = "file_edit";
         target.status = payload.success === false ? "failed" : "completed";
-        target.text = target.status === "failed" ? "编辑文件失败" : `已编辑 ${changed} 个文件`;
+        target.text = target.status === "failed" ? "编辑文件失败" : describeEdit("已编辑", paths.length ? paths : extractActivityPaths(target.text), changed);
         refreshLatest(activity);
       } else {
         const step = activityStep(event, index, "file_edit", payload.success === false ? "编辑文件失败" : `已编辑 ${changed} 个文件`, callId || undefined);
