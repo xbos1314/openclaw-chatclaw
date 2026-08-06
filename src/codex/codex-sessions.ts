@@ -28,6 +28,12 @@ export interface CodexMessage {
   text: string;
 }
 
+export interface CodexHistoryPage {
+  events: CodexEvent[];
+  has_more: boolean;
+  next_before: string | null;
+}
+
 export interface CodexTaskStatus {
   completed: boolean;
   lastCompleteTs: string | null;
@@ -172,6 +178,7 @@ const INTERNAL_CONTEXT_TAGS = [
   "system",
   "system_context",
   "developer_instructions",
+  "recommended_plugins",
 ];
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -233,6 +240,81 @@ export function extractMessages(events: CodexEvent[]): CodexMessage[] {
   return messages;
 }
 
+/**
+ * 从 JSONL 的指定字节位置向前读取消息事件。游标始终指向一条完整 JSONL
+ * 记录的起始位置，因此下一页不会丢失或重复消息；读取过程按块向前扫描，
+ * 不会把整个历史会话载入内存。
+ */
+export async function readMessageHistory(
+  file: string,
+  size: number,
+  before?: string | number | null,
+  limit = 50,
+): Promise<CodexHistoryPage> {
+  const requested = Number(before);
+  let position = Number.isFinite(requested) && requested >= 0
+    ? Math.min(Math.floor(requested), size)
+    : size;
+  const messageLimit = Math.max(1, Math.min(Number(limit) || 50, 50));
+  const chunkSize = 128 * 1024;
+  const records: Array<{ offset: number; event: CodexEvent }> = [];
+  let carry = Buffer.alloc(0);
+  let messageCount = 0;
+  let handle: fs.FileHandle | null = null;
+
+  try {
+    handle = await fs.open(file, "r");
+    while (position > 0 && messageCount < messageLimit) {
+      const start = Math.max(0, position - chunkSize);
+      const chunk = Buffer.alloc(position - start);
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, start);
+      const source = bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead);
+      const combined = carry.length ? Buffer.concat([source, carry]) : source;
+      const firstNewline = start > 0 ? combined.indexOf(0x0a) : -1;
+      if (start > 0 && firstNewline < 0) {
+        carry = combined;
+        position = start;
+        continue;
+      }
+
+      const completeStart = start > 0 ? firstNewline + 1 : 0;
+      const completeOffset = start + completeStart;
+      const completeSource = combined.subarray(completeStart);
+      const lastNewline = completeSource.lastIndexOf(0x0a);
+      const complete = lastNewline >= 0 ? completeSource.subarray(0, lastNewline + 1) : Buffer.alloc(0);
+      carry = start > 0 ? combined.subarray(0, firstNewline + 1) : Buffer.alloc(0);
+
+      const chunkRecords: Array<{ offset: number; event: CodexEvent }> = [];
+      let lineStart = 0;
+      for (let index = 0; index < complete.length; index += 1) {
+        if (complete[index] !== 0x0a) continue;
+        const line = complete.subarray(lineStart, index).toString("utf8").trim();
+        if (line) {
+          try {
+            const event = JSON.parse(line) as CodexEvent;
+            chunkRecords.push({ offset: completeOffset + lineStart, event });
+          } catch {
+            // 历史中损坏的单行不应阻塞后续可读记录。
+          }
+        }
+        lineStart = index + 1;
+      }
+      records.unshift(...chunkRecords);
+      messageCount += extractMessages(chunkRecords.map((item) => item.event)).length;
+      position = start;
+    }
+  } finally {
+    await handle?.close();
+  }
+
+  const messageRecords = records.filter((item) => extractMessages([item.event]).length > 0);
+  if (!messageRecords.length) return { events: [], has_more: false, next_before: null };
+  const firstReturned = messageRecords[Math.max(0, messageRecords.length - messageLimit)];
+  const events = records.filter((item) => item.offset >= firstReturned.offset).map((item) => item.event);
+  const hasMore = position > 0 && firstReturned.offset > 0;
+  return { events, has_more: hasMore, next_before: hasMore ? String(firstReturned.offset) : null };
+}
+
 export function taskStatus(events: CodexEvent[]): CodexTaskStatus {
   let completed = false;
   let lastCompleteTs: string | null = null;
@@ -248,7 +330,7 @@ export function taskStatus(events: CodexEvent[]): CodexTaskStatus {
   return { completed, lastCompleteTs };
 }
 
-const MAX_ACTIVITY_STEPS = 24;
+const MAX_ACTIVITY_STEPS = 12;
 const MAX_ACTIVITY_DETAIL_LENGTH = 96;
 
 function asObject(value: unknown): Record<string, any> {

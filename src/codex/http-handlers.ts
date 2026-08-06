@@ -20,6 +20,8 @@ interface NewSessionBody {
   message?: string;
   full_auto?: boolean;
 }
+interface ApprovalBody { decision?: "accept" | "decline"; }
+interface QueueBody { content?: string; }
 
 /** 从 /codex/sessions/:id/xxx 中提取会话 id */
 function extractSessionId(parsedUrl: ParsedUrl): string {
@@ -151,6 +153,26 @@ export async function handleCodexArchivedSnapshot(
 	}
 }
 
+/** GET /codex/(archived-)sessions/:id/history?before=byteOffset&limit=50 — 向前分页读取历史消息。 */
+export async function handleCodexHistory(
+	res: http.ServerResponse,
+	_req: http.IncomingMessage,
+	parsedUrl: ParsedUrl,
+	ctx: RequestContext,
+	archived = false,
+): Promise<void> {
+	requireAuth(ctx);
+	try {
+		const sessionId = extractSessionId(parsedUrl);
+		const before = parsedUrl.searchParams.get("before") ?? undefined;
+		const limit = parseInt(parsedUrl.searchParams.get("limit") ?? "50", 10);
+		const result = await manager.getMessageHistory(sessionId, before, Number.isFinite(limit) ? limit : 50, ctx.accountId, archived);
+		sendJson(res, 200, { code: 0, data: result });
+	} catch (err) {
+		handleError(res, err);
+	}
+}
+
 /** GET /codex/sessions/:id/updates?cursor=byteOffset — 仅返回文件追加内容 */
 export async function handleCodexUpdates(
   res: http.ServerResponse,
@@ -167,6 +189,19 @@ export async function handleCodexUpdates(
   } catch (err) {
     handleError(res, err);
   }
+}
+
+export async function handleCodexInterrupt(res: http.ServerResponse, _req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
+  requireAuth(ctx); try { await manager.interruptSession(extractSessionId(parsedUrl), ctx.accountId); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
+}
+export async function handleCodexApproval(res: http.ServerResponse, req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
+  requireAuth(ctx); try { const body = await parseBody<ApprovalBody>(req); const id = decodeURIComponent((parsedUrl.pathname ?? "").split("/").filter(Boolean)[4] ?? ""); if (!id || (body.decision !== "accept" && body.decision !== "decline")) throw new Error("审批参数无效"); await manager.decideApproval(extractSessionId(parsedUrl), ctx.accountId, id, body.decision === "accept"); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
+}
+export async function handleCodexQueueUpdate(res: http.ServerResponse, req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
+  requireAuth(ctx); try { const body = await parseBody<QueueBody>(req); const id = decodeURIComponent((parsedUrl.pathname ?? "").split("/").filter(Boolean)[4] ?? ""); await manager.updateQueuedMessage(extractSessionId(parsedUrl), ctx.accountId, id, String(body.content ?? "")); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
+}
+export async function handleCodexQueueRemove(res: http.ServerResponse, _req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
+  requireAuth(ctx); try { const id = decodeURIComponent((parsedUrl.pathname ?? "").split("/").filter(Boolean)[4] ?? ""); await manager.removeQueuedMessage(extractSessionId(parsedUrl), ctx.accountId, id); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
 }
 
 /** POST /codex/sessions/:id/send — 向会话发消息（续跑） */

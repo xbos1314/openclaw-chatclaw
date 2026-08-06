@@ -4,3 +4,7 @@ dist
 .DS_Store
 .idea
 coverage/
+
+# Codex session data (local only)
+sessions/
+archived_sessions/

@@ -5,6 +5,8 @@ import os from "node:os";
 import * as codexSessions from "./codex-sessions.js";
 import * as filesDB from "../db/files.js";
 import * as fileStorage from "../media/fileStorage.js";
+import * as codexQueue from "../db/codex-queue.js";
+import { CodexAppServerRunner, type CodexExecution } from "./app-server-runner.js";
 
 export const CODEX_BIN = process.env.CODEX_BIN ?? "/Users/xbos1314/.nvm/versions/node/v22.19.0/bin/codex";
 const EXEC_TIMEOUT_MS = 600_000;
@@ -24,8 +26,10 @@ export interface CodexMessage { ts: string; role: "user" | "assistant"; text: st
 export interface CodexLastMessage { ts: string; role: "user" | "assistant"; text: string; }
 export interface CodexStatus { session_id: string; project: string; status: "running" | "completed"; last_write_sec: number; last_complete_at: string | null; last_message: CodexLastMessage | null; }
 export interface CodexPage<T> { items: T[]; has_more: boolean; next_cursor: string | null; }
-export interface CodexSnapshot { session_id: string; project: string; messages: CodexMessage[]; cursor: string; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; }
-export interface CodexUpdates { session_id: string; messages: CodexMessage[]; cursor: string; reset: boolean; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; }
+export interface CodexQueueItem { id: string; content: string; attachments: unknown[]; full_auto: boolean; created_at: number; }
+export interface CodexSnapshot { session_id: string; project: string; messages: CodexMessage[]; cursor: string; history_has_more: boolean; history_before: string | null; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; execution: CodexExecution; queue: CodexQueueItem[]; }
+export interface CodexUpdates { session_id: string; messages: CodexMessage[]; cursor: string; reset: boolean; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; execution: CodexExecution; queue: CodexQueueItem[]; }
+export interface CodexHistoryPage { session_id: string; messages: CodexMessage[]; has_more: boolean; next_before: string | null; }
 export interface CodexRunResult { exit_code: number; output: string; stderr: string; timed_out: boolean; }
 export interface CodexExecOptions { fullAuto?: boolean; timeoutMs?: number; }
 export interface CodexSendAttachmentInput {
@@ -44,6 +48,8 @@ interface RuntimeState { status: CodexStatus; activity: codexSessions.CodexTurnA
 interface ArchiveFileEntry { file: string; archivedAtMs: number; }
 const sessionCache = new Map<string, CachedSession>();
 const runtimeCache = new Map<string, RuntimeState>();
+const runners = new Map<string, CodexAppServerRunner>();
+const runnerAccounts = new Map<string, string>();
 let archiveIndex: { expiresAt: number; entries: ArchiveFileEntry[] } | null = null;
 
 export class CodexNotFoundError extends Error {
@@ -223,6 +229,28 @@ function formatMessages(events: codexSessions.CodexEvent[], _accountId?: string)
   }));
 }
 
+function idleExecution(): CodexExecution { return { status: "idle", turn_id: null, full_auto: true, approval: null }; }
+function publicQueue(items: codexQueue.CodexQueueItem[]): CodexQueueItem[] { return items.map((item) => ({ id: item.id, content: item.content, attachments: JSON.parse(item.attachments || "[]"), full_auto: item.fullAuto, created_at: item.createdAt })); }
+function getRunner(sessionId: string, cwd: string, accountId: string): CodexAppServerRunner {
+  let runner = runners.get(sessionId);
+  if (!runner) { runner = new CodexAppServerRunner(CODEX_BIN, sessionId, cwd); runners.set(sessionId, runner); runner.onCompleted(() => { void drainQueue(sessionId, cwd, runnerAccounts.get(sessionId) || accountId); }); }
+  runnerAccounts.set(sessionId, accountId);
+  return runner;
+}
+async function drainQueue(sessionId: string, cwd: string, accountId: string): Promise<void> {
+  const runner = getRunner(sessionId, cwd, accountId);
+  if (runner.execution.status !== "idle") return;
+  const item = (await codexQueue.listQueue(accountId, sessionId))[0];
+  if (!item) return;
+  await runner.start(item.content, item.fullAuto);
+  await codexQueue.removeQueueItem(accountId, sessionId, item.id);
+}
+async function sessionRuntime(sessionId: string, accountId?: string): Promise<{ execution: CodexExecution; queue: CodexQueueItem[] }> {
+  const runner = runners.get(sessionId);
+  const queue = accountId ? publicQueue(await codexQueue.listQueue(accountId, sessionId)) : [];
+  return { execution: runner ? { ...runner.execution, approval: runner.execution.approval ? { ...runner.execution.approval } : null } : idleExecution(), queue };
+}
+
 function buildStatus(sessionId: string, project: string, mtimeMs: number, events: codexSessions.CodexEvent[], fallback?: CodexStatus): CodexStatus {
   const lifecycle = codexSessions.taskStatus(events);
   const messages = formatMessages(events);
@@ -245,18 +273,24 @@ async function getSnapshotFromEntry(sessionId: string, archived: boolean, limit 
 	const stats = await codexSessions.fileStat(entry.file);
 	const tail = await codexSessions.readTail(entry.file, stats.size);
   const events = codexSessions.parseEvents(tail.text);
+	const history = await codexSessions.readMessageHistory(entry.file, stats.size, undefined, clampLimit(limit));
   const id = String(entry.meta.session_id ?? sessionId);
 	const project = String(entry.meta.cwd ?? "");
 	const status = buildStatus(id, project, stats.mtimeMs, events, runtimeCache.get(id)?.status);
 	const activity = codexSessions.extractLatestTurnActivity(events, runtimeCache.get(id)?.activity);
+	const runtime = await sessionRuntime(id, accountId);
 	runtimeCache.set(id, { status, activity });
 	return {
 		session_id: id,
 		project,
-		messages: formatMessages(events, accountId).slice(-clampLimit(limit)),
+		messages: formatMessages(history.events, accountId),
 		cursor: String(tail.nextOffset),
+		history_has_more: history.has_more,
+		history_before: history.next_before,
 		status,
 		activity,
+		execution: runtime.execution,
+		queue: runtime.queue,
 		archived,
 		archived_at: archived ? codexSessions.formatTime(new Date(stats.ctimeMs).toISOString(), true) : null,
 	};
@@ -273,6 +307,18 @@ export async function getArchivedSnapshot(sessionId: string, limit = 50, account
 	return getSnapshotFromEntry(sessionId, true, limit, accountId) as Promise<CodexSnapshot & { archived: true; archived_at: string | null }>;
 }
 
+export async function getMessageHistory(sessionId: string, before?: string, limit = 50, accountId?: string, archived = false): Promise<CodexHistoryPage> {
+	const entry = await resolveSession(sessionId, archived);
+	const stats = await codexSessions.fileStat(entry.file);
+	const history = await codexSessions.readMessageHistory(entry.file, stats.size, before, clampLimit(limit));
+	return {
+		session_id: String(entry.meta.session_id ?? sessionId),
+		messages: formatMessages(history.events, accountId),
+		has_more: history.has_more,
+		next_before: history.next_before,
+	};
+}
+
 /** 详情页轮询：无变化只 stat；有变化只读取此前游标之后的完整 JSONL 行。 */
 export async function getUpdates(sessionId: string, cursor: string, accountId?: string): Promise<CodexUpdates> {
   const entry = await resolveSession(sessionId);
@@ -280,14 +326,15 @@ export async function getUpdates(sessionId: string, cursor: string, accountId?: 
   const previous = Number(cursor);
   if (!Number.isFinite(previous) || previous < 0 || stats.size < previous) {
     const snapshot = await getSnapshot(sessionId, 50, accountId);
-    return { session_id: snapshot.session_id, messages: snapshot.messages, cursor: snapshot.cursor, reset: true, status: snapshot.status, activity: snapshot.activity };
+    return { session_id: snapshot.session_id, messages: snapshot.messages, cursor: snapshot.cursor, reset: true, status: snapshot.status, activity: snapshot.activity, execution: snapshot.execution, queue: snapshot.queue };
   }
   const id = String(entry.meta.session_id ?? sessionId);
   const project = String(entry.meta.cwd ?? "");
   if (stats.size === previous) {
     const cached = runtimeCache.get(id);
     const status = cached?.status ?? buildStatus(id, project, stats.mtimeMs, []);
-    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) }, activity: cached?.activity ?? null };
+    const runtime = await sessionRuntime(id, accountId);
+    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) }, activity: cached?.activity ?? null, execution: runtime.execution, queue: runtime.queue };
   }
   const range = await codexSessions.readCompleteRange(entry.file, previous, stats.size, MAX_UPDATE_BYTES);
   const events = codexSessions.parseEvents(range.text);
@@ -295,7 +342,8 @@ export async function getUpdates(sessionId: string, cursor: string, accountId?: 
   const status = buildStatus(id, project, stats.mtimeMs, events, cached?.status);
   const activity = codexSessions.extractLatestTurnActivity(events, cached?.activity);
   runtimeCache.set(id, { status, activity });
-	return { session_id: id, messages: formatMessages(events, accountId), cursor: String(range.nextOffset), reset: false, status, activity };
+  const runtime = await sessionRuntime(id, accountId);
+  return { session_id: id, messages: formatMessages(events, accountId), cursor: String(range.nextOffset), reset: false, status, activity, execution: runtime.execution, queue: runtime.queue };
 }
 
 /**
@@ -369,19 +417,28 @@ async function resolveAttachments(
   return resolved;
 }
 
-export async function sendMessage(sessionId: string, message: string, options: CodexSendOptions = {}): Promise<{ session_id: string; reply: string; content: string; exit_code: number }> {
+export async function sendMessage(sessionId: string, message: string, options: CodexSendOptions = {}): Promise<{ session_id: string; reply: string; content: string; exit_code: number; queued: boolean }> {
   const { meta } = await resolveSession(sessionId);
   const cwd = String(meta.cwd ?? process.cwd());
   const fullSessionId = String(meta.session_id ?? sessionId);
   const attachments = await resolveAttachments(options.attachments, options.accountId);
   const input = codexSessions.serializeChatClawMessage(attachments, message);
   if (!input) throw new Error("消息或附件不能为空");
-  const args = ["exec", "resume"];
-  if (options.fullAuto) args.push("--dangerously-bypass-approvals-and-sandbox");
-  args.push(fullSessionId, input);
-  await startCodexDetached(args, cwd);
-  return { session_id: fullSessionId, reply: "续跑已启动", content: input, exit_code: 0 };
+  const accountId = options.accountId;
+  if (!accountId) throw new Error("发送消息需要认证账号");
+  const runner = getRunner(fullSessionId, cwd, accountId);
+  if (runner.execution.status !== "idle" && runner.execution.status !== "interrupted") {
+    await codexQueue.enqueue(accountId, fullSessionId, input, JSON.stringify(options.attachments ?? []), Boolean(options.fullAuto));
+    return { session_id: fullSessionId, reply: "消息已加入队列", content: input, exit_code: 0, queued: true };
+  }
+  await runner.start(input, Boolean(options.fullAuto));
+  return { session_id: fullSessionId, reply: "续跑已启动", content: input, exit_code: 0, queued: false };
 }
+
+export async function interruptSession(sessionId: string, accountId: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); const runner = runners.get(id); if (!runner || runnerAccounts.get(id) !== accountId) throw new Error("没有可停止的任务"); await runner.interrupt(); }
+export async function decideApproval(sessionId: string, accountId: string, approvalId: string, accept: boolean): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); const runner = runners.get(id); if (!runner || runnerAccounts.get(id) !== accountId) throw new Error("审批请求不存在或已失效"); await runner.decide(approvalId, accept); }
+export async function updateQueuedMessage(sessionId: string, accountId: string, queueId: string, content: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); if (!content.trim()) throw new Error("排队内容不能为空"); if (!await codexQueue.updateQueueItem(accountId, id, queueId, content.trim())) throw new CodexNotFoundError("找不到排队消息"); }
+export async function removeQueuedMessage(sessionId: string, accountId: string, queueId: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); if (!await codexQueue.removeQueueItem(accountId, id, queueId)) throw new CodexNotFoundError("找不到排队消息"); }
 
 export async function newSession(projectDir: string, message: string, options: CodexExecOptions = {}): Promise<{ session_id: string; project: string; output: string; exit_code: number }> {
   const resolved = path.resolve(projectDir);
