@@ -12,12 +12,14 @@ import { logger } from "../util/logger.js";
 interface SendMessageBody {
   message?: string;
   attachments?: manager.CodexSendAttachmentInput[];
+  authorization_mode?: manager.CodexAuthorizationMode;
   full_auto?: boolean;
 }
 
 interface NewSessionBody {
   project?: string;
   message?: string;
+  authorization_mode?: manager.CodexAuthorizationMode;
   full_auto?: boolean;
 }
 interface ApprovalBody { decision?: "accept" | "decline"; }
@@ -222,13 +224,14 @@ export async function handleCodexSend(
     }
     const sessionId = extractSessionId(parsedUrl);
     const result = await manager.sendMessage(sessionId, message, {
+      authorizationMode: body.authorization_mode,
       fullAuto: body.full_auto ?? false,
       accountId: ctx.accountId,
       attachments,
     });
     sendJson(res, 200, {
       code: 0,
-      data: { ...result, full_auto: body.full_auto ?? false },
+      data: { ...result, authorization_mode: body.authorization_mode ?? (body.full_auto ? "full_access" : "request_approval") },
     });
   } catch (err) {
     handleError(res, err);
@@ -284,11 +287,12 @@ export async function handleCodexNew(
       return;
     }
     const result = await manager.newSession(project, message, {
+      authorizationMode: body.authorization_mode,
       fullAuto: body.full_auto ?? false,
     });
     sendJson(res, 200, {
       code: 0,
-      data: { ...result, full_auto: body.full_auto ?? false },
+      data: { ...result, authorization_mode: body.authorization_mode ?? (body.full_auto ? "full_access" : "request_approval") },
     });
   } catch (err) {
     handleError(res, err);

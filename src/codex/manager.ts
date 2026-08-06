@@ -7,6 +7,9 @@ import * as filesDB from "../db/files.js";
 import * as fileStorage from "../media/fileStorage.js";
 import * as codexQueue from "../db/codex-queue.js";
 import { CodexAppServerRunner, type CodexExecution } from "./app-server-runner.js";
+import { DEFAULT_CODEX_AUTHORIZATION_MODE, isFullAccessAuthorization, normalizeCodexAuthorizationMode, type CodexAuthorizationMode } from "./authorization.js";
+
+export type { CodexAuthorizationMode } from "./authorization.js";
 
 export const CODEX_BIN = process.env.CODEX_BIN ?? "/Users/xbos1314/.nvm/versions/node/v22.19.0/bin/codex";
 const EXEC_TIMEOUT_MS = 600_000;
@@ -26,12 +29,12 @@ export interface CodexMessage { ts: string; role: "user" | "assistant"; text: st
 export interface CodexLastMessage { ts: string; role: "user" | "assistant"; text: string; }
 export interface CodexStatus { session_id: string; project: string; status: "running" | "completed"; last_write_sec: number; last_complete_at: string | null; last_message: CodexLastMessage | null; }
 export interface CodexPage<T> { items: T[]; has_more: boolean; next_cursor: string | null; }
-export interface CodexQueueItem { id: string; content: string; attachments: unknown[]; full_auto: boolean; created_at: number; }
+export interface CodexQueueItem { id: string; content: string; attachments: unknown[]; authorization_mode: CodexAuthorizationMode; created_at: number; }
 export interface CodexSnapshot { session_id: string; project: string; messages: CodexMessage[]; cursor: string; history_has_more: boolean; history_before: string | null; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; execution: CodexExecution; queue: CodexQueueItem[]; }
 export interface CodexUpdates { session_id: string; messages: CodexMessage[]; cursor: string; reset: boolean; status: CodexStatus; activity: codexSessions.CodexTurnActivity | null; execution: CodexExecution; queue: CodexQueueItem[]; }
 export interface CodexHistoryPage { session_id: string; messages: CodexMessage[]; has_more: boolean; next_before: string | null; }
 export interface CodexRunResult { exit_code: number; output: string; stderr: string; timed_out: boolean; }
-export interface CodexExecOptions { fullAuto?: boolean; timeoutMs?: number; }
+export interface CodexExecOptions { authorizationMode?: CodexAuthorizationMode; fullAuto?: boolean; timeoutMs?: number; }
 export interface CodexSendAttachmentInput {
   type: "image" | "video" | "voice" | "audio" | "file" | "path";
   file_id?: string;
@@ -229,8 +232,9 @@ function formatMessages(events: codexSessions.CodexEvent[], _accountId?: string)
   }));
 }
 
-function idleExecution(): CodexExecution { return { status: "idle", turn_id: null, full_auto: true, approval: null }; }
-function publicQueue(items: codexQueue.CodexQueueItem[]): CodexQueueItem[] { return items.map((item) => ({ id: item.id, content: item.content, attachments: JSON.parse(item.attachments || "[]"), full_auto: item.fullAuto, created_at: item.createdAt })); }
+function resolveAuthorizationMode(options: CodexExecOptions = {}): CodexAuthorizationMode { return normalizeCodexAuthorizationMode(options.authorizationMode, options.fullAuto); }
+function idleExecution(): CodexExecution { return { status: "idle", turn_id: null, authorization_mode: DEFAULT_CODEX_AUTHORIZATION_MODE, approval: null }; }
+function publicQueue(items: codexQueue.CodexQueueItem[]): CodexQueueItem[] { return items.map((item) => ({ id: item.id, content: item.content, attachments: JSON.parse(item.attachments || "[]"), authorization_mode: item.authorizationMode, created_at: item.createdAt })); }
 function getRunner(sessionId: string, cwd: string, accountId: string): CodexAppServerRunner {
   let runner = runners.get(sessionId);
   if (!runner) { runner = new CodexAppServerRunner(CODEX_BIN, sessionId, cwd); runners.set(sessionId, runner); runner.onCompleted((interrupted) => { if (!interrupted) void drainQueue(sessionId, cwd, runnerAccounts.get(sessionId) || accountId); }); }
@@ -242,7 +246,7 @@ async function drainQueue(sessionId: string, cwd: string, accountId: string): Pr
   if (runner.execution.status !== "idle") return;
   const item = (await codexQueue.listQueue(accountId, sessionId))[0];
   if (!item) return;
-  await runner.start(item.content, item.fullAuto);
+  await runner.start(item.content, item.authorizationMode);
   await codexQueue.removeQueueItem(accountId, sessionId, item.id);
 }
 async function sessionRuntime(sessionId: string, accountId?: string): Promise<{ execution: CodexExecution; queue: CodexQueueItem[] }> {
@@ -453,10 +457,10 @@ export async function sendMessage(sessionId: string, message: string, options: C
   if (!accountId) throw new Error("发送消息需要认证账号");
   const runner = getRunner(fullSessionId, cwd, accountId);
   if (runner.execution.status !== "idle" && runner.execution.status !== "interrupted") {
-    await codexQueue.enqueue(accountId, fullSessionId, input, JSON.stringify(options.attachments ?? []), Boolean(options.fullAuto));
+    await codexQueue.enqueue(accountId, fullSessionId, input, JSON.stringify(options.attachments ?? []), resolveAuthorizationMode(options));
     return { session_id: fullSessionId, reply: "消息已加入队列", content: input, exit_code: 0, queued: true };
   }
-  await runner.start(input, Boolean(options.fullAuto));
+  await runner.start(input, resolveAuthorizationMode(options));
   return { session_id: fullSessionId, reply: "续跑已启动", content: input, exit_code: 0, queued: false };
 }
 
@@ -471,7 +475,10 @@ export async function newSession(projectDir: string, message: string, options: C
   if (!projectStats?.isDirectory()) throw new Error(`项目目录不存在: ${projectDir}`);
   const before = new Set(await codexSessions.activeSessionFiles());
   const args = ["exec"];
-  if (options.fullAuto) args.push("--dangerously-bypass-approvals-and-sandbox");
+  const authorizationMode = resolveAuthorizationMode(options);
+  if (isFullAccessAuthorization(authorizationMode)) args.push("--dangerously-bypass-approvals-and-sandbox");
+  else if (authorizationMode === "auto_review") args.push("--sandbox", "workspace-write", "-c", 'approval_policy="on-request"', "-c", 'approvals_reviewer="auto_review"');
+  else args.push("--sandbox", "workspace-write", "-c", 'approval_policy="untrusted"');
   args.push("--skip-git-repo-check", message);
   const child = spawn(CODEX_BIN, args, { cwd: resolved, detached: true, stdio: "ignore" });
   child.on("error", (err) => console.error(`[codex] spawn failed: ${err.message}`));

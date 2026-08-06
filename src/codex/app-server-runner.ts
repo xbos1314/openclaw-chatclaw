@@ -1,9 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
+import type { CodexAuthorizationMode } from "./authorization.js";
 
 export type ExecutionStatus = "idle" | "running" | "waiting_approval" | "stopping" | "interrupted";
 export interface CodexApproval { id: string; type: "command" | "file_change" | "permission"; summary: string; requestId: string | number; }
-export interface CodexExecution { status: ExecutionStatus; turn_id: string | null; full_auto: boolean; approval: CodexApproval | null; }
+export interface CodexExecution { status: ExecutionStatus; turn_id: string | null; authorization_mode: CodexAuthorizationMode; approval: CodexApproval | null; }
 
 type CompletionListener = (interrupted: boolean) => void;
 interface PendingRequest { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; }
@@ -32,7 +33,7 @@ export class CodexAppServerRunner {
   private completionListeners = new Set<CompletionListener>();
   private initialized = false;
   private interruptionRequested = false;
-  readonly execution: CodexExecution = { status: "idle", turn_id: null, full_auto: true, approval: null };
+  readonly execution: CodexExecution = { status: "idle", turn_id: null, authorization_mode: "request_approval", approval: null };
 
   constructor(private readonly bin: string, private readonly threadId: string, private readonly cwd: string) {}
 
@@ -92,19 +93,22 @@ export class CodexAppServerRunner {
     });
   }
 
-  async start(input: string, fullAuto: boolean): Promise<void> {
+  async start(input: string, authorizationMode: CodexAuthorizationMode): Promise<void> {
     await this.ensureConnected();
     if (this.execution.status !== "idle" && this.execution.status !== "interrupted") throw new Error("会话正在执行");
+    const isFullAccess = authorizationMode === "full_access";
     const result = await this.request("turn/start", {
       threadId: this.threadId,
       input: [{ type: "text", text: input }],
-      approvalPolicy: fullAuto ? "never" : "untrusted",
-      approvalsReviewer: "user",
-      sandbox: fullAuto ? "danger-full-access" : "workspace-write",
+      approvalPolicy: isFullAccess ? "never" : authorizationMode === "auto_review" ? "on-request" : "untrusted",
+      approvalsReviewer: authorizationMode === "auto_review" ? "auto_review" : "user",
+      sandboxPolicy: isFullAccess
+        ? { type: "dangerFullAccess" }
+        : { type: "workspaceWrite", writableRoots: [this.cwd], networkAccess: false },
     });
     this.execution.status = "running";
     this.interruptionRequested = false;
-    this.execution.full_auto = fullAuto;
+    this.execution.authorization_mode = authorizationMode;
     this.execution.turn_id = String(result?.turn?.id ?? result?.turnId ?? "") || null;
     this.execution.approval = null;
   }

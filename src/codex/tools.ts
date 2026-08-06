@@ -24,7 +24,8 @@ const CodexManagerSchema = Type.Object({
   project: Type.Optional(Type.String()), // sessions 过滤 / new：项目路径
   session_id: Type.Optional(Type.String()), // read/status/recent/send：会话 id（支持前缀）
   message: Type.Optional(Type.String()), // send/new：消息内容
-  full_auto: Type.Optional(Type.Boolean()), // send/new：完全授权（高危，需用户确认）
+  authorization_mode: Type.Optional(Type.Union([Type.Literal("request_approval"), Type.Literal("auto_review"), Type.Literal("full_access")])), // send/new：授权策略
+  full_auto: Type.Optional(Type.Boolean()), // 兼容旧调用：true 等同 full_access
   confirmed: Type.Optional(Type.Boolean()), // send/new：用户确认标记
   limit: Type.Optional(Type.Number()), // read：条数
   seconds: Type.Optional(Type.Number()), // recent：秒数
@@ -36,6 +37,7 @@ interface CodexToolParams {
   project?: string;
   session_id?: string;
   message?: string;
+  authorization_mode?: manager.CodexAuthorizationMode;
   full_auto?: boolean;
   confirmed?: boolean;
   limit?: number;
@@ -49,7 +51,7 @@ export function registerCodexManagerTools(api: any): void {
       "Codex 项目管理工具：查看本机 Codex 的项目/会话/任务状态、读取对话、向会话发消息、新建任务。" +
       "只读操作（projects/find/sessions/read/status/recent）可直接执行；" +
       "send（唤醒会话续跑，可能打断运行中的任务）和 new（新建任务，会修改项目文件）属于外部动作，首次调用返回 need_confirm，需用户明确确认后带 confirmed=true 再次调用。" +
-      "full_auto=true 为完全授权模式（Codex 可自主执行所有操作），高危，必须用户确认。",
+      "authorization_mode 可选 request_approval（请求用户批准）、auto_review（替用户自动审批）或 full_access（完全访问）；完全访问高危，必须用户确认。",
     parameters: CodexManagerSchema,
     execute: async (_toolCallId: string, params: CodexToolParams) => {
       try {
@@ -95,41 +97,41 @@ export function registerCodexManagerTools(api: any): void {
             if (!params.session_id?.trim() || !params.message?.trim()) {
               return { ok: false, error: "session_id 和 message 必填" };
             }
-            const fullAuto = params.full_auto ?? false;
+            const authorizationMode = params.authorization_mode ?? (params.full_auto ? "full_access" : "request_approval");
             if (!params.confirmed) {
               return {
                 ok: false,
                 need_confirm: true,
                 detail:
                   `将唤醒会话 ${params.session_id} 并发送消息，可能打断正在运行的任务。` +
-                  `${fullAuto ? "已开启完全授权模式（Codex 可自主执行所有操作）。" : ""}` +
+                  `${authorizationMode === "full_access" ? "已开启完全访问模式（Codex 可自主执行所有操作）。" : authorizationMode === "auto_review" ? "将由 Codex 替用户审查需批准的操作。" : ""}` +
                   `请用户确认后以 confirmed=true 重新调用。`,
               };
             }
             const result = await manager.sendMessage(params.session_id.trim(), params.message.trim(), {
-              fullAuto,
+              authorizationMode,
             });
-            return { ok: true, ...result, full_auto: fullAuto };
+            return { ok: true, ...result, authorization_mode: authorizationMode };
           }
           case "new": {
             if (!params.project?.trim() || !params.message?.trim()) {
               return { ok: false, error: "project 和 message 必填" };
             }
-            const fullAuto = params.full_auto ?? false;
+            const authorizationMode = params.authorization_mode ?? (params.full_auto ? "full_access" : "request_approval");
             if (!params.confirmed) {
               return {
                 ok: false,
                 need_confirm: true,
                 detail:
                   `将在 ${params.project} 开启新 Codex 任务并修改项目文件。` +
-                  `${fullAuto ? "已开启完全授权模式（Codex 可自主执行所有操作）。" : ""}` +
+                  `${authorizationMode === "full_access" ? "已开启完全访问模式（Codex 可自主执行所有操作）。" : authorizationMode === "auto_review" ? "将由 Codex 替用户审查需批准的操作。" : ""}` +
                   `请用户确认后以 confirmed=true 重新调用。`,
               };
             }
             const result = await manager.newSession(params.project.trim(), params.message.trim(), {
-              fullAuto,
+              authorizationMode,
             });
-            return { ok: true, ...result, full_auto: fullAuto };
+            return { ok: true, ...result, authorization_mode: authorizationMode };
           }
           default:
             return { ok: false, error: `Unknown action: ${params.action}` };
