@@ -16,6 +16,7 @@ import { getAccountTypingStates } from "../typing/state.js";
 import { handleMemoVoice, handleMemoList, handleMemoGet, handleMemoSend, handleMemoUpdate, handleMemoDelete, handleVoiceDownload } from "./memo-handlers.js";
 import { handleFileSystemList } from "./filesystem-handlers.js";
 import { handleLocalFileMeta, handleLocalFileText, handleLocalFileView } from "./local-file-handlers.js";
+import { handleSystemDiskUsage, handleSystemOverview, handleSystemProcesses } from "./system-handlers.js";
 import {
   handleDocumentCreate,
   handleDocumentDelete,
@@ -110,6 +111,12 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleRefreshDownloadToken(res, req, ctx);
       } else if (parsedUrl.pathname === "/filesystem/list" && req.method === "GET") {
         await handleFileSystemList(res, req, parsedUrl, ctx);
+      } else if (parsedUrl.pathname === "/system/overview" && req.method === "GET") {
+        await handleSystemOverview(res, req, ctx);
+      } else if (parsedUrl.pathname === "/system/processes" && req.method === "GET") {
+        await handleSystemProcesses(res, req, parsedUrl, ctx);
+      } else if (parsedUrl.pathname === "/system/disk-usage" && req.method === "GET") {
+        await handleSystemDiskUsage(res, req, ctx);
       } else if (parsedUrl.pathname === "/agents" && req.method === "GET") {
         await handleGetAgents(res, req, ctx);
       } else if (parsedUrl.pathname === "/messages/unread-count" && req.method === "GET") {
