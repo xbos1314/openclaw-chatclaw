@@ -384,8 +384,36 @@ function describeEdit(prefix: "正在编辑" | "已编辑", paths: string[], cha
   return detail ? `${prefix} ${detail}` : `${prefix} ${Math.max(1, Number(changed) || 1)} 个文件`;
 }
 
-function commandFor(payload: Record<string, any>, input: Record<string, any>): string {
-  return String(input.cmd ?? input.command ?? payload.command ?? "");
+function decodeJsonString(value: string): string {
+  try { return JSON.parse(value) as string; } catch { return ""; }
+}
+
+/** Codex desktop 会把函数工具调用包装成 JS 源码，实际参数位于 tools.exec_command({ cmd: ... })。 */
+function commandsFromWrappedToolInput(value: unknown): string[] {
+  const source = String(value ?? "");
+  const commands: string[] = [];
+  const matches = source.matchAll(/["'](?:cmd|command)["']\s*:\s*("(?:\\.|[^"\\])*")/g);
+  for (const match of matches) {
+    const command = decodeJsonString(match[1]);
+    if (command) commands.push(command);
+  }
+  return [...new Set(commands)];
+}
+
+function wrappedToolNames(value: unknown): string[] {
+  const source = String(value ?? "");
+  return [...new Set([...source.matchAll(/tools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map((match) => match[1]))];
+}
+
+function commandFor(payload: Record<string, any>, input: Record<string, any>, rawInput: unknown): string {
+  const direct = String(input.cmd ?? input.command ?? payload.command ?? "");
+  if (direct) return direct;
+  return commandsFromWrappedToolInput(rawInput).join("；");
+}
+
+function isWrappedPatchInput(value: unknown): boolean {
+  const source = String(value ?? "");
+  return /tools\.apply_patch\s*\(|\*\*\* (?:Update|Add|Delete) File:/.test(source);
 }
 
 function describeToolCall(payload: Record<string, any>): { kind: CodexActivityKind; text: string; callId?: string } {
@@ -394,10 +422,22 @@ function describeToolCall(payload: Record<string, any>): { kind: CodexActivityKi
   const rawInput = payload.input ?? payload.arguments ?? payload.params;
   const input = asObject(rawInput);
   if (name === "exec" || name === "exec_command") {
-    const command = commandFor(payload, input);
-    const paths = extractActivityPaths(command);
-    const readsFiles = /\b(cat|sed|head|tail|less|more|rg|grep|find|ls)\b/.test(command);
-    if (readsFiles && paths.length) return { kind: "file_read", text: `正在查看 ${formatActivityPaths(paths)}`, ...(callId ? { callId } : {}) };
+    const paths = extractActivityPaths([input, rawInput]);
+    if (isWrappedPatchInput(rawInput)) {
+      return { kind: "file_edit", text: describeEdit("正在编辑", paths), ...(callId ? { callId } : {}) };
+    }
+    const wrappedTools = wrappedToolNames(rawInput);
+    if (wrappedTools.includes("view_image")) {
+      return { kind: "file_read", text: paths.length ? `正在查看 ${formatActivityPaths(paths)}` : "正在查看图片", ...(callId ? { callId } : {}) };
+    }
+    const nestedTool = wrappedTools.find((tool) => tool !== "exec_command");
+    if (nestedTool) {
+      return { kind: "tool", text: `正在调用工具：${nestedTool}`, ...(callId ? { callId } : {}) };
+    }
+    const command = commandFor(payload, input, rawInput);
+    const commandPaths = paths.length ? paths : extractActivityPaths(command);
+    const readsFiles = /^\s*(?:cat|sed|head|tail|less|more|rg|grep|find|ls)\b/.test(command);
+    if (readsFiles && commandPaths.length) return { kind: "file_read", text: `正在查看 ${formatActivityPaths(commandPaths)}`, ...(callId ? { callId } : {}) };
     return { kind: "command", text: `正在执行：${compactActivityDetail(command) || "命令"}`, ...(callId ? { callId } : {}) };
   }
   if (name === "apply_patch" || name === "write_file" || name === "edit_file") {
@@ -461,7 +501,8 @@ export function extractLatestTurnActivity(events: CodexEvent[], previous?: Codex
       const callId = String(payload.call_id ?? "");
       const changed = Array.isArray(payload.changes) ? payload.changes.length : Number(payload.files_changed ?? payload.changed_files ?? 1) || 1;
       const paths = extractActivityPaths(payload.changes ?? payload.files);
-      const target = callId ? [...activity.activities].reverse().find((step) => step.call_id === callId) : null;
+      const target = [...activity.activities].reverse().find((step) => step.call_id === callId)
+        ?? [...activity.activities].reverse().find((step) => step.kind === "file_edit" && step.status === "running");
       if (target) {
         target.kind = "file_edit";
         target.status = payload.success === false ? "failed" : "completed";
