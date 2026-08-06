@@ -233,7 +233,7 @@ function idleExecution(): CodexExecution { return { status: "idle", turn_id: nul
 function publicQueue(items: codexQueue.CodexQueueItem[]): CodexQueueItem[] { return items.map((item) => ({ id: item.id, content: item.content, attachments: JSON.parse(item.attachments || "[]"), full_auto: item.fullAuto, created_at: item.createdAt })); }
 function getRunner(sessionId: string, cwd: string, accountId: string): CodexAppServerRunner {
   let runner = runners.get(sessionId);
-  if (!runner) { runner = new CodexAppServerRunner(CODEX_BIN, sessionId, cwd); runners.set(sessionId, runner); runner.onCompleted(() => { void drainQueue(sessionId, cwd, runnerAccounts.get(sessionId) || accountId); }); }
+  if (!runner) { runner = new CodexAppServerRunner(CODEX_BIN, sessionId, cwd); runners.set(sessionId, runner); runner.onCompleted((interrupted) => { if (!interrupted) void drainQueue(sessionId, cwd, runnerAccounts.get(sessionId) || accountId); }); }
   runnerAccounts.set(sessionId, accountId);
   return runner;
 }
@@ -277,8 +277,8 @@ async function getSnapshotFromEntry(sessionId: string, archived: boolean, limit 
   const id = String(entry.meta.session_id ?? sessionId);
 	const project = String(entry.meta.cwd ?? "");
 	const status = buildStatus(id, project, stats.mtimeMs, events, runtimeCache.get(id)?.status);
-	const activity = codexSessions.extractLatestTurnActivity(events, runtimeCache.get(id)?.activity);
 	const runtime = await sessionRuntime(id, accountId);
+	const activity = runtime.execution.status === "interrupted" ? null : codexSessions.extractLatestTurnActivity(events, runtimeCache.get(id)?.activity);
 	runtimeCache.set(id, { status, activity });
 	return {
 		session_id: id,
@@ -334,15 +334,15 @@ export async function getUpdates(sessionId: string, cursor: string, accountId?: 
     const cached = runtimeCache.get(id);
     const status = cached?.status ?? buildStatus(id, project, stats.mtimeMs, []);
     const runtime = await sessionRuntime(id, accountId);
-    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) }, activity: cached?.activity ?? null, execution: runtime.execution, queue: runtime.queue };
+    return { session_id: id, messages: [], cursor, reset: false, status: { ...status, last_write_sec: Math.max(0, Math.round((Date.now() - stats.mtimeMs) / 1000)) }, activity: runtime.execution.status === "interrupted" ? null : cached?.activity ?? null, execution: runtime.execution, queue: runtime.queue };
   }
   const range = await codexSessions.readCompleteRange(entry.file, previous, stats.size, MAX_UPDATE_BYTES);
   const events = codexSessions.parseEvents(range.text);
   const cached = runtimeCache.get(id);
   const status = buildStatus(id, project, stats.mtimeMs, events, cached?.status);
-  const activity = codexSessions.extractLatestTurnActivity(events, cached?.activity);
-  runtimeCache.set(id, { status, activity });
   const runtime = await sessionRuntime(id, accountId);
+  const activity = runtime.execution.status === "interrupted" ? null : codexSessions.extractLatestTurnActivity(events, cached?.activity);
+  runtimeCache.set(id, { status, activity });
   return { session_id: id, messages: formatMessages(events, accountId), cursor: String(range.nextOffset), reset: false, status, activity, execution: runtime.execution, queue: runtime.queue };
 }
 
@@ -358,6 +358,31 @@ export async function unarchiveSession(sessionId: string, options: CodexExecOpti
 	if (result.exit_code !== 0) {
 		throw new Error(codexSessions.truncateText(result.stderr.trim() || result.output.trim() || "取消归档失败", MAX_OUTPUT));
 	}
+	sessionCache.delete(fullSessionId);
+	runtimeCache.delete(fullSessionId);
+	archiveIndex = null;
+	return { session_id: fullSessionId, project: String(meta.cwd ?? "") };
+}
+
+/**
+ * 将空闲会话移入 Codex 归档目录。运行中的会话必须先停止，避免归档
+ * 正在写入的 JSONL 文件；归档完成后关闭本地 runner 并清除各级缓存。
+ */
+export async function archiveSession(sessionId: string, options: CodexExecOptions = {}): Promise<{ session_id: string; project: string }> {
+	const { meta } = await resolveSession(sessionId);
+	const fullSessionId = String(meta.session_id ?? sessionId);
+	const runner = runners.get(fullSessionId);
+	if (runner && runner.execution.status !== "idle" && runner.execution.status !== "interrupted") {
+		throw new Error("正在执行的会话不能归档，请先停止任务");
+	}
+	const cwd = String(meta.cwd ?? process.cwd());
+	const result = await runCodex(["archive", fullSessionId], cwd, options.timeoutMs ?? 30_000);
+	if (result.exit_code !== 0) {
+		throw new Error(codexSessions.truncateText(result.stderr.trim() || result.output.trim() || "归档失败", MAX_OUTPUT));
+	}
+	runner?.close();
+	runners.delete(fullSessionId);
+	runnerAccounts.delete(fullSessionId);
 	sessionCache.delete(fullSessionId);
 	runtimeCache.delete(fullSessionId);
 	archiveIndex = null;
@@ -435,7 +460,7 @@ export async function sendMessage(sessionId: string, message: string, options: C
   return { session_id: fullSessionId, reply: "续跑已启动", content: input, exit_code: 0, queued: false };
 }
 
-export async function interruptSession(sessionId: string, accountId: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); const runner = runners.get(id); if (!runner || runnerAccounts.get(id) !== accountId) throw new Error("没有可停止的任务"); await runner.interrupt(); }
+export async function interruptSession(sessionId: string, accountId: string): Promise<CodexExecution> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); const runner = runners.get(id); if (!runner || runnerAccounts.get(id) !== accountId) throw new Error("没有可停止的任务"); await runner.interrupt(); return { ...runner.execution, approval: runner.execution.approval ? { ...runner.execution.approval } : null }; }
 export async function decideApproval(sessionId: string, accountId: string, approvalId: string, accept: boolean): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); const runner = runners.get(id); if (!runner || runnerAccounts.get(id) !== accountId) throw new Error("审批请求不存在或已失效"); await runner.decide(approvalId, accept); }
 export async function updateQueuedMessage(sessionId: string, accountId: string, queueId: string, content: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); if (!content.trim()) throw new Error("排队内容不能为空"); if (!await codexQueue.updateQueueItem(accountId, id, queueId, content.trim())) throw new CodexNotFoundError("找不到排队消息"); }
 export async function removeQueuedMessage(sessionId: string, accountId: string, queueId: string): Promise<void> { const entry = await resolveSession(sessionId); const id = String(entry.meta.session_id ?? sessionId); if (!await codexQueue.removeQueueItem(accountId, id, queueId)) throw new CodexNotFoundError("找不到排队消息"); }

@@ -5,7 +5,7 @@ export type ExecutionStatus = "idle" | "running" | "waiting_approval" | "stoppin
 export interface CodexApproval { id: string; type: "command" | "file_change" | "permission"; summary: string; requestId: string | number; }
 export interface CodexExecution { status: ExecutionStatus; turn_id: string | null; full_auto: boolean; approval: CodexApproval | null; }
 
-type CompletionListener = () => void;
+type CompletionListener = (interrupted: boolean) => void;
 interface PendingRequest { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; }
 
 function summarize(value: unknown, max = 240): string {
@@ -31,6 +31,7 @@ export class CodexAppServerRunner {
   private pending = new Map<string, PendingRequest>();
   private completionListeners = new Set<CompletionListener>();
   private initialized = false;
+  private interruptionRequested = false;
   readonly execution: CodexExecution = { status: "idle", turn_id: null, full_auto: true, approval: null };
 
   constructor(private readonly bin: string, private readonly threadId: string, private readonly cwd: string) {}
@@ -64,8 +65,10 @@ export class CodexAppServerRunner {
       return;
     }
     if (message.method === "turn/completed") {
-      this.execution.status = "idle"; this.execution.turn_id = null; this.execution.approval = null;
-      for (const listener of this.completionListeners) listener();
+      const interrupted = this.interruptionRequested || this.execution.status === "stopping";
+      this.interruptionRequested = false;
+      if (interrupted) this.markInterrupted(); else { this.execution.status = "idle"; this.execution.turn_id = null; this.execution.approval = null; }
+      for (const listener of this.completionListeners) listener(interrupted);
     }
   }
 
@@ -100,6 +103,7 @@ export class CodexAppServerRunner {
       sandbox: fullAuto ? "danger-full-access" : "workspace-write",
     });
     this.execution.status = "running";
+    this.interruptionRequested = false;
     this.execution.full_auto = fullAuto;
     this.execution.turn_id = String(result?.turn?.id ?? result?.turnId ?? "") || null;
     this.execution.approval = null;
@@ -108,8 +112,17 @@ export class CodexAppServerRunner {
   async interrupt(): Promise<void> {
     if (!this.execution.turn_id) throw new Error("没有可停止的任务");
     await this.ensureConnected();
+    const previousStatus = this.execution.status;
+    this.interruptionRequested = true;
     this.execution.status = "stopping";
-    await this.request("turn/interrupt", { threadId: this.threadId, turnId: this.execution.turn_id });
+    try {
+      await this.request("turn/interrupt", { threadId: this.threadId, turnId: this.execution.turn_id });
+      this.markInterrupted();
+    } catch (err) {
+      this.interruptionRequested = false;
+      this.execution.status = previousStatus;
+      throw err;
+    }
   }
 
   async decide(approvalId: string, accept: boolean): Promise<void> {

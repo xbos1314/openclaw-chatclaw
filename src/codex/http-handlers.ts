@@ -192,7 +192,7 @@ export async function handleCodexUpdates(
 }
 
 export async function handleCodexInterrupt(res: http.ServerResponse, _req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
-  requireAuth(ctx); try { await manager.interruptSession(extractSessionId(parsedUrl), ctx.accountId); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
+  requireAuth(ctx); try { const execution = await manager.interruptSession(extractSessionId(parsedUrl), ctx.accountId); sendJson(res, 200, { code: 0, data: { execution } }); } catch (err) { handleError(res, err); }
 }
 export async function handleCodexApproval(res: http.ServerResponse, req: http.IncomingMessage, parsedUrl: ParsedUrl, ctx: RequestContext): Promise<void> {
   requireAuth(ctx); try { const body = await parseBody<ApprovalBody>(req); const id = decodeURIComponent((parsedUrl.pathname ?? "").split("/").filter(Boolean)[4] ?? ""); if (!id || (body.decision !== "accept" && body.decision !== "decline")) throw new Error("审批参数无效"); await manager.decideApproval(extractSessionId(parsedUrl), ctx.accountId, id, body.decision === "accept"); sendJson(res, 200, { code: 0, data: {} }); } catch (err) { handleError(res, err); }
@@ -245,6 +245,22 @@ export async function handleCodexUnarchive(
 	requireAuth(ctx);
 	try {
 		const result = await manager.unarchiveSession(extractSessionId(parsedUrl));
+		sendJson(res, 200, { code: 0, data: result });
+	} catch (err) {
+		handleError(res, err);
+	}
+}
+
+/** POST /codex/sessions/:id/archive — 将空闲会话归档。 */
+export async function handleCodexArchive(
+	res: http.ServerResponse,
+	_req: http.IncomingMessage,
+	parsedUrl: ParsedUrl,
+	ctx: RequestContext,
+): Promise<void> {
+	requireAuth(ctx);
+	try {
+		const result = await manager.archiveSession(extractSessionId(parsedUrl));
 		sendJson(res, 200, { code: 0, data: result });
 	} catch (err) {
 		handleError(res, err);

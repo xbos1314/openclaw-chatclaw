@@ -36,6 +36,7 @@ import {
   handleCodexHistory,
   handleCodexUpdates,
   handleCodexSend,
+  handleCodexArchive,
   handleCodexUnarchive,
   handleCodexNew,
   handleCodexInterrupt,
@@ -217,6 +218,8 @@ export async function startHttpServer(options: HttpServerOptions): Promise<http.
         await handleCodexHistory(res, req, parsedUrl, ctx!, true);
       } else if (parsedUrl.pathname.match(/^\/codex\/archived-sessions\/[^/]+\/unarchive$/) && req.method === "POST") {
         await handleCodexUnarchive(res, req, parsedUrl, ctx!);
+      } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/archive$/) && req.method === "POST") {
+        await handleCodexArchive(res, req, parsedUrl, ctx!);
       } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/snapshot$/) && req.method === "GET") {
         await handleCodexSnapshot(res, req, parsedUrl, ctx!);
       } else if (parsedUrl.pathname.match(/^\/codex\/sessions\/[^/]+\/history$/) && req.method === "GET") {
