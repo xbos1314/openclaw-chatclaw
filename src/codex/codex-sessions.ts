@@ -181,6 +181,7 @@ const INTERNAL_CONTEXT_TAGS = [
   "recommended_plugins",
 ];
 const AGENTS_INSTRUCTIONS_BLOCK = /(?:^|\n)\s*#\s*AGENTS\.md instructions for[^\r\n]*\r?\n\s*<INSTRUCTIONS>\s*[\s\S]*?<\/INSTRUCTIONS>\s*(?=\n|$)/gi;
+const CODEX_UI_DIRECTIVE_LINE = /(?:^|\n)\s*::(?:git-(?:stage|commit|create-branch|push|create-pr)|created-thread)\{[^\n]*\}\s*(?=\n|$)/gi;
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -190,6 +191,8 @@ export function stripInternalContext(text: string): string {
   let output = String(text ?? "");
   // Codex 将项目 AGENTS.md 作为 role=user 的独立 input_text 写入 JSONL；这不是用户实际发送的消息。
   output = output.replace(AGENTS_INSTRUCTIONS_BLOCK, "");
+  // Codex 桌面端的 Git/线程 UI 指令仅供本地客户端消费，不属于应展示给 ChatClaw 用户的回复正文。
+  output = output.replace(CODEX_UI_DIRECTIVE_LINE, "");
   for (const tag of INTERNAL_CONTEXT_TAGS) {
     const escaped = escapeRegExp(tag);
     output = output.replace(new RegExp(`<${escaped}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escaped}>`, "gi"), "");
