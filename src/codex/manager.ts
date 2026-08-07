@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -11,7 +12,28 @@ import { DEFAULT_CODEX_AUTHORIZATION_MODE, isFullAccessAuthorization, normalizeC
 
 export type { CodexAuthorizationMode } from "./authorization.js";
 
-export const CODEX_BIN = process.env.CODEX_BIN ?? "/Users/xbos1314/.nvm/versions/node/v22.19.0/bin/codex";
+/**
+ * 解析 codex 可执行文件路径，不硬编码用户目录。
+ * 优先级：环境变量 CODEX_BIN > nvm 各版本 bin 目录 > 回退 "codex"（由系统 PATH 解析）。
+ */
+function resolveCodexBin(): string {
+  if (process.env.CODEX_BIN) return process.env.CODEX_BIN;
+  const nvmRoots: string[] = [];
+  if (process.env.NVM_DIR) nvmRoots.push(path.join(process.env.NVM_DIR, "versions", "node"));
+  nvmRoots.push(path.join(os.homedir(), ".nvm", "versions", "node"));
+  for (const root of nvmRoots) {
+    try {
+      const versions = readdirSync(root).sort().reverse();
+      for (const version of versions) {
+        const candidate = path.join(root, version, "bin", "codex");
+        if (existsSync(candidate)) return candidate;
+      }
+    } catch { /* 目录不存在则跳过 */ }
+  }
+  return "codex";
+}
+
+export const CODEX_BIN = resolveCodexBin();
 const EXEC_TIMEOUT_MS = 600_000;
 const MAX_OUTPUT = 2000;
 const PAGE_SIZE = 20;
