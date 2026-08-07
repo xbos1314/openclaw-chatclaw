@@ -365,6 +365,7 @@ const MIME_TYPES: Record<string, string> = {
   ".html": "text/html",
   ".css": "text/css",
   ".js": "application/javascript",
+  ".cjs": "application/javascript",
   ".json": "application/json",
   ".xml": "application/xml",
 };

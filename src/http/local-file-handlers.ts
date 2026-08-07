@@ -11,7 +11,7 @@ import { verifyDownloadToken } from "../auth/token.js";
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([
   ".md", ".markdown", ".txt", ".log", ".json", ".jsonc", ".yaml", ".yml", ".toml", ".xml", ".html", ".htm", ".css", ".scss", ".less",
-  ".js", ".jsx", ".ts", ".tsx", ".vue", ".java", ".kt", ".kts", ".py", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cs", ".php", ".rb", ".sh", ".zsh", ".sql", ".swift", ".dart", ".lua", ".ini", ".env",
+  ".js", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".java", ".kt", ".kts", ".py", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cs", ".php", ".rb", ".sh", ".zsh", ".sql", ".swift", ".dart", ".lua", ".ini", ".env",
 ]);
 const SENSITIVE_HOME_DIRECTORIES = new Set([".ssh", ".gnupg", ".aws", ".kube", ".docker", ".npmrc", ".config/gcloud"]);
 
