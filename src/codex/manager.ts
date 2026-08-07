@@ -17,7 +17,6 @@ const MAX_OUTPUT = 2000;
 const PAGE_SIZE = 20;
 const PAGE_SCAN_LIMIT = 60;
 const MAX_UPDATE_BYTES = 512 * 1024;
-const SESSION_SUMMARY_TAIL_BYTES = 128 * 1024;
 const SESSION_SUMMARY_MAX_LENGTH = 120;
 const SESSION_SUMMARY_CONCURRENCY = 4;
 const ARCHIVE_INDEX_TTL_MS = 60_000;
@@ -182,12 +181,11 @@ export async function listArchivedSessions(cursor?: string, limit?: number): Pro
 	};
 }
 
-/** 仅查阅有限的文件尾部，避免列表页为摘要读取完整 JSONL。 */
+/** 使用与会话详情相同的消息提取路径，取最后一条用户可见消息作为摘要。 */
 async function readLastTextSummary(file: string, size: number): Promise<string> {
   try {
-    const tail = await codexSessions.readTail(file, size, SESSION_SUMMARY_TAIL_BYTES);
-    const messages = codexSessions.extractMessages(codexSessions.parseEvents(tail.text));
-    const lastMessage = [...messages].reverse().find((message) => message.text.trim());
+    const history = await codexSessions.readMessageHistory(file, size, undefined, 1);
+    const lastMessage = codexSessions.extractMessages(history.events).at(-1);
     return lastMessage ? codexSessions.truncateText(lastMessage.text.replace(/\s+/g, " "), SESSION_SUMMARY_MAX_LENGTH) : "";
   } catch {
     return "";

@@ -83,10 +83,22 @@ async function sessionFilesIn(directory: string): Promise<string[]> {
 	return files;
 }
 
-/** 只异步遍历活跃 sessions 目录；文件名本身包含时间，可用于最新优先排序。 */
+/**
+ * 只异步遍历活跃 sessions 目录，并按实际最近写入时间倒序。
+ * 文件名中的时间是会话创建时间，后续继续对话时不会变化，不能用于最近活动排序。
+ */
 export async function activeSessionFiles(): Promise<string[]> {
 	const files = await sessionFilesIn(ACTIVE_SESSIONS_DIR);
-	return files.sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
+	const entries = await Promise.all(files.map(async (file) => {
+		try {
+			return { file, mtimeMs: (await fs.stat(file)).mtimeMs };
+		} catch {
+			return { file, mtimeMs: 0 };
+		}
+	}));
+	return entries
+		.sort((a, b) => b.mtimeMs - a.mtimeMs || path.basename(b.file).localeCompare(path.basename(a.file)))
+		.map((entry) => entry.file);
 }
 
 /** 归档会话仅在归档接口中读取，排序由归档时更新的文件 ctime 在 manager 层完成。 */
@@ -186,6 +198,10 @@ const CODEX_UI_DIRECTIVE_LINE = /(?:^|\n)\s*::(?:git-(?:stage|commit|create-bran
 const CODEX_DESKTOP_IMAGE_TAG = /<image\b[^>]*\bpath\s*=\s*(["'])(.*?)\1[^>]*>/gi;
 const CODEX_DESKTOP_IMAGE_CLOSE_TAG = /<\/image\s*>/gi;
 const STANDALONE_CODEX_DESKTOP_IMAGE_CLOSE_TAG = /^\s*<\/image\s*>\s*$/i;
+const TRANSCRIPT_START_MARKER = /^\s*>>>\s*TRANSCRIPT START\s*$/i;
+const TRANSCRIPT_END_MARKER = /^\s*>>>\s*TRANSCRIPT END\s*$/i;
+const APPROVAL_REQUEST_START_MARKER = /^\s*>>>\s*APPROVAL REQUEST START\s*$/i;
+const APPROVAL_REQUEST_END_MARKER = /^\s*>>>\s*APPROVAL REQUEST END\s*$/i;
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -214,6 +230,20 @@ function hasConvertibleDesktopImageTag(text: string): boolean {
   }
   CODEX_DESKTOP_IMAGE_TAG.lastIndex = 0;
   return false;
+}
+
+/** 审批审查器把转录与裁决写入同一 JSONL；它们不是会话中的用户可见消息。 */
+function isApprovalReviewResult(text: string): boolean {
+  try {
+    const value = JSON.parse(String(text || "").trim());
+    return !!value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.risk_level === "string"
+      && typeof value.user_authorization === "string"
+      && typeof value.outcome === "string"
+      && typeof value.rationale === "string";
+  } catch {
+    return false;
+  }
 }
 
 /** 删除 Codex 写入 JSONL 的内部运行环境块，保留真正的对话正文。 */
@@ -260,6 +290,8 @@ export function serializeChatClawMessage(files: Array<{ fileName: string; filePa
 export function extractMessages(events: CodexEvent[]): CodexMessage[] {
   const messages: CodexMessage[] = [];
   let awaitingDesktopImageCloseTag = false;
+  let skippingTranscript = false;
+  let skippingApprovalRequest = false;
   for (const event of events) {
     if (event.type !== "response_item") continue;
     const payload = event.payload;
@@ -277,6 +309,23 @@ export function extractMessages(events: CodexEvent[]): CodexMessage[] {
         part.text.trim()
       ) {
         const rawText = part.text;
+        if (TRANSCRIPT_START_MARKER.test(rawText)) {
+          skippingTranscript = true;
+          continue;
+        }
+        if (TRANSCRIPT_END_MARKER.test(rawText)) {
+          skippingTranscript = false;
+          continue;
+        }
+        if (APPROVAL_REQUEST_START_MARKER.test(rawText)) {
+          skippingApprovalRequest = true;
+          continue;
+        }
+        if (APPROVAL_REQUEST_END_MARKER.test(rawText)) {
+          skippingApprovalRequest = false;
+          continue;
+        }
+        if (skippingTranscript || skippingApprovalRequest || isApprovalReviewResult(rawText)) continue;
         if (awaitingDesktopImageCloseTag && STANDALONE_CODEX_DESKTOP_IMAGE_CLOSE_TAG.test(rawText)) {
           awaitingDesktopImageCloseTag = false;
           continue;

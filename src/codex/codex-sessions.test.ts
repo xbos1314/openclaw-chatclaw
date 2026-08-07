@@ -119,47 +119,61 @@ describe("codex-sessions 核心层", () => {
     );
   });
 
-  it("allSessionFiles 扫描活动 + 归档目录", () => {
-    const files = codex.allSessionFiles();
-    expect(files).toHaveLength(2);
-    expect(files.some((f) => f.includes(ACTIVE_ID))).toBe(true);
-    expect(files.some((f) => f.includes(ARCHIVED_ID))).toBe(true);
+  it("分别扫描活动和归档会话目录", async () => {
+    const [activeFiles, archivedFiles] = await Promise.all([
+      codex.activeSessionFiles(),
+      codex.archivedSessionFiles(),
+    ]);
+    expect(activeFiles).toHaveLength(1);
+    expect(activeFiles[0]).toContain(ACTIVE_ID);
+    expect(archivedFiles).toHaveLength(1);
+    expect(archivedFiles[0]).toContain(ARCHIVED_ID);
   });
 
-  it("readMeta 读取 session_id / cwd / originator", () => {
-    const file = codex.allSessionFiles().find((f) => f.includes(ACTIVE_ID))!;
-    const meta = codex.readMeta(file);
+  it("readMeta 读取 session_id / cwd / originator", async () => {
+    const [file] = await codex.activeSessionFiles();
+    const meta = await codex.readMeta(file);
     expect(meta.session_id).toBe(ACTIVE_ID);
     expect(meta.cwd).toBe("/Users/test/proj-a");
     expect(meta.originator).toBe("Codex Desktop");
   });
 
-  it("extractMessages 提取 user/assistant 消息与工具调用标记", () => {
-    const file = codex.allSessionFiles().find((f) => f.includes(ACTIVE_ID))!;
-    const messages = codex.extractMessages(codex.parseEvents(file));
+  it("extractMessages 提取用户可见的 user/assistant 消息", async () => {
+    const [file] = await codex.activeSessionFiles();
+    const contents = fs.readFileSync(file, "utf8");
+    const messages = codex.extractMessages(codex.parseEvents(contents));
     expect(messages).toHaveLength(3);
     expect(messages[0]).toMatchObject({ role: "user", text: "你好，帮我实现登录" });
     expect(messages[1]).toMatchObject({ role: "assistant" });
     expect(messages[2]).toMatchObject({ role: "assistant", text: "登录页已完成" });
   });
 
-  it("taskStatus 识别已完成（task_complete）", () => {
-    const active = codex.allSessionFiles().find((f) => f.includes(ACTIVE_ID))!;
-    const archived = codex.allSessionFiles().find((f) => f.includes(ARCHIVED_ID))!;
-    const activeStatus = codex.taskStatus(codex.parseEvents(active));
-    const archivedStatus = codex.taskStatus(codex.parseEvents(archived));
+  it("taskStatus 识别已完成（task_complete）", async () => {
+    const [[active], [archived]] = await Promise.all([
+      codex.activeSessionFiles(),
+      codex.archivedSessionFiles(),
+    ]);
+    const activeStatus = codex.taskStatus(codex.parseEvents(fs.readFileSync(active, "utf8")));
+    const archivedStatus = codex.taskStatus(codex.parseEvents(fs.readFileSync(archived, "utf8")));
     expect(activeStatus.completed).toBe(true);
     expect(activeStatus.lastCompleteTs).not.toBeNull();
     expect(archivedStatus.completed).toBe(false);
   });
 
-  it("findSession 支持前缀匹配与文件名匹配", () => {
-    expect(codex.findSession("019faaaa").meta.session_id).toBe(ACTIVE_ID);
-    expect(codex.findSession("019fbbbb").meta.session_id).toBe(ARCHIVED_ID);
-    // 文件名包含匹配
-    expect(codex.findSession(ACTIVE_ID.slice(0, 8)).meta.session_id).toBe(ACTIVE_ID);
-    // 不存在
-    expect(codex.findSession("zzz").file).toBeNull();
+  it("extractMessages 会忽略审批转录和风险裁决 JSON", () => {
+    const messages = codex.extractMessages([
+      { type: "response_item", timestamp: iso(20), payload: { role: "assistant", content: [{ type: "output_text", text: "已推送至 Gitee。" }] } },
+      { type: "response_item", timestamp: iso(10), payload: { role: "user", content: [
+        { type: "input_text", text: ">>> TRANSCRIPT START" },
+        { type: "input_text", text: "内部转录内容" },
+        { type: "input_text", text: ">>> TRANSCRIPT END" },
+        { type: "input_text", text: ">>> APPROVAL REQUEST START" },
+        { type: "input_text", text: "内部审批请求" },
+        { type: "input_text", text: ">>> APPROVAL REQUEST END" },
+      ] } },
+      { type: "response_item", timestamp: iso(5), payload: { role: "assistant", content: [{ type: "output_text", text: '{"risk_level":"high","user_authorization":"medium","outcome":"deny","rationale":"内部裁决"}' }] } },
+    ]);
+    expect(messages).toEqual([{ ts: expect.any(String), role: "assistant", text: "已推送至 Gitee。" }]);
   });
 
   it("formatTime 输出 MM/DD HH:mm 格式", () => {
